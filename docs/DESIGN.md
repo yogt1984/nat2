@@ -67,10 +67,18 @@ lookahead queryable instead of a code-review hope; `nat2 audit causal` enforces 
 FAILs on any diff.
 
 **Reconstruct, don't poll.** Polling `clearinghouseState` per wallet makes HL's rate limits the
-map's *resolution*. Instead: rebuild positions from the fill stream, derive liquidation prices
-using per-asset `maxLeverage` from `meta`, and use `clearinghouseState` only to reconcile a
-rotating sample and alarm on drift. Cross and isolated margin get separate paths — a cross
+map's *resolution*. Measured 2026-08-07: 3,596 wallets take ~5 minutes per sweep and consume the
+entire IP weight budget, leaving nothing for the tape. So polling is reconciliation only —
+rebuild positions from the fill stream (`userFills` is public for any address and arrives as
+snapshot-then-incremental), derive liquidation prices from per-asset `maxLeverage` in `meta`, and
+poll a rotating sample to alarm on drift. Cross and isolated margin get separate paths — a cross
 wallet's whole map moves when any one of its positions moves.
+
+**Two registries, two seeds.** The leaderboard exposes 41,392 wallets with equity and windowed
+volume. Seeded by equity, the top 2,000 cover 61% of venue OI but only 28% hold any position;
+seeded by weekly volume the same 2,000 cover 39% while 46% are active. Union of both: **69% of
+venue OI** (BTC 68%, ETH 79%, HYPE 70%, SOL 66%). So the map registry is seeded by equity — it
+wants whoever holds size — and the skill cohort by volume, since it wants whoever trades.
 
 **Start day one.** Point-in-time series can't be recovered later. The daemon runs while the rest
 is built; day 1 of M0 is the project's real start date.
@@ -254,14 +262,18 @@ Nothing here is hardcoded; each must be read from the API or confirmed against c
 with a test that fails loudly if it moves: liquidation formula and maintenance margin vs
 `maxLeverage` (diffed against `clearinghouseState.liquidationPx`) · mark-price construction and
 which price triggers liquidation · funding formula, cadence, clamp · HLP/ADL thresholds ·
-rate-limit weights · node-data format, retention and cost (this sizes M3) · fee tiers and
-rebates · rounding rules and order-type semantics · usable mainnet history depth (this sets
+rate-limit weights · **websocket subscription limits per connection and connections per IP**
+(a ~3,600-wallet registry needs multiplexed `userFills` subscriptions; this sets how many
+connections the daemon opens) · node-data format, retention and cost (this sizes M3) · fee tiers
+and rebates · rounding rules and order-type semantics · usable mainnet history depth (this sets
 embargo width).
 
 ## Open questions
 
-1. **Registry scope** — whole-venue reconstruction from node data (exact, heavy) vs a top-N
-   registry (cheap, caps coverage). Decides whether M3 is one week or three.
+1. ~~**Registry scope**~~ — *settled 2026-08-07 by measurement.* Leaderboard-seeded registry with
+   live fill reconstruction reaches 69% of venue OI, enough for M1; node-data whole-venue backfill
+   moves to M3, where per-wallet history is what persistence testing actually needs. M1 is not
+   blocked on it.
 2. **Bar clock** — time bars for v1; revisit dollar bars after `gate magnet`.
 3. **Universe breadth** — majors and liquid mid-caps, or reach into the alt tail where cascades
    are strongest and data quality is worst? Let the liquidity block decide at M2, not taste.

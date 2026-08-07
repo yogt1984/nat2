@@ -23,6 +23,8 @@ capture_app = typer.Typer(no_args_is_help=True, help="Capture daemons")
 audit_app = typer.Typer(no_args_is_help=True, help="Data integrity audits")
 gate_app = typer.Typer(no_args_is_help=True, help="Falsification gates")
 log_app = typer.Typer(no_args_is_help=True, help="Hash-chained ledger")
+wallets_app = typer.Typer(no_args_is_help=True, help="Wallet registry")
+app.add_typer(wallets_app, name="wallets")
 app.add_typer(capture_app, name="capture")
 app.add_typer(audit_app, name="audit")
 app.add_typer(gate_app, name="gate")
@@ -211,6 +213,201 @@ def gate_status(ledger: LedgerOpt = LEDGER) -> None:
         failed = verdict.detail.get("failed") or []
         table.add_row(name, mark, f"{verdict.age_s / 3600:.1f}h", ", ".join(failed) or "-")
     console.print(table)
+
+
+REGISTRY = Path("data/registry.sqlite")
+RegistryOpt = Annotated[Path, typer.Option("--registry", help="wallet registry database")]
+
+
+async def _marks_and_oi(testnet: bool = False) -> tuple[dict, dict]:
+    """Mark price and OI notional per coin, from one request."""
+    info = InfoClient(WeightBudget(), testnet=testnet)
+    meta, ctxs = await info.meta_and_asset_ctxs()
+    await info.aclose()
+    marks, oi = {}, {}
+    for asset, ctx in zip(meta["universe"], ctxs):
+        mark = float(ctx.get("markPx") or 0)
+        if not mark:
+            continue
+        marks[asset["name"]] = mark
+        oi[asset["name"]] = float(ctx.get("openInterest") or 0) * mark
+    return marks, oi
+
+
+@wallets_app.command("seed")
+def wallets_seed(
+    top_equity: Annotated[int, typer.Option(help="seeds the liquidation map")] = 2000,
+    top_volume: Annotated[int, typer.Option(help="seeds the skill cohort")] = 2000,
+    registry: RegistryOpt = REGISTRY,
+) -> None:
+    """Seed the registry from HL's leaderboard.
+
+    Two seeds, because they select different populations: equity finds whoever
+    holds size, volume finds whoever trades.
+    """
+    from nat2.core.registry import Registry
+    from nat2.hl import leaderboard
+
+    async def _run() -> None:
+        console.print("fetching leaderboard …")
+        rows = await leaderboard.fetch()
+        tags = leaderboard.seed(rows, top_equity, top_volume)
+        stored = Registry(registry).seed_wallets(rows, tags)
+        counts: dict[str, int] = {}
+        for tag in tags.values():
+            counts[tag] = counts.get(tag, 0) + 1
+        console.print(
+            f"leaderboard {len(rows)} wallets -> registry {stored} "
+            f"({', '.join(f'{k} {v}' for k, v in sorted(counts.items()))})"
+        )
+
+    asyncio.run(_run())
+
+
+@wallets_app.command("snapshot")
+def wallets_snapshot(
+    limit: Annotated[int, typer.Option(help="0 = whole registry")] = 0,
+    registry: RegistryOpt = REGISTRY,
+    testnet: bool = False,
+) -> None:
+    """Reconcile positions from clearinghouseState. Costs ~5 min for a full registry."""
+    from nat2.core.registry import Registry
+    from nat2.io.snapshot import sweep
+
+    async def _run() -> None:
+        reg = Registry(registry)
+        addresses = reg.addresses(limit=limit or None)
+        if not addresses:
+            console.print("[red]registry is empty -- run `nat2 wallets seed` first[/red]")
+            raise typer.Exit(1)
+        info = InfoClient(WeightBudget(), testnet=testnet)
+        console.print(f"sweeping {len(addresses)} wallets …")
+        result = await sweep(
+            reg, info, addresses,
+            on_progress=lambda d, n: console.print(f"[dim]  … {d}/{n}[/dim]"),
+        )
+        await info.aclose()
+        console.print(
+            f"snapshot {result['id']}: {result['positions']} positions from "
+            f"{result['holders']}/{result['wallets']} wallets, {result['errors']} error(s), "
+            f"{result['elapsed_s']:.0f}s"
+        )
+
+    asyncio.run(_run())
+
+
+@wallets_app.command("status")
+def wallets_status(registry: RegistryOpt = REGISTRY) -> None:
+    """Registry size, seeds, and snapshot age."""
+    from nat2.core.registry import Registry
+
+    reg = Registry(registry)
+    counts = reg.wallet_count()
+    snapshot = reg.last_snapshot()
+    age = reg.position_age_ns()
+    console.print(f"wallets: {sum(counts.values())} ({counts})")
+    if snapshot:
+        console.print(
+            f"last snapshot #{snapshot['id']}: {snapshot['positions']} positions from "
+            f"{snapshot['holders']}/{snapshot['wallets']} wallets, "
+            f"{snapshot['errors']} error(s)"
+        )
+    console.print(f"positions age: {age / NS / 60:.1f}m" if age else "positions: none")
+
+
+@app.command("map")
+def map_show(
+    coin: str,
+    registry: RegistryOpt = REGISTRY,
+    buckets: Annotated[int, typer.Option(help="rows to display each side")] = 8,
+) -> None:
+    """Liquidation map for one coin, with the coverage number that qualifies it."""
+    from nat2.core.registry import Registry
+    from nat2.features.liqmap import OI_SIDES, build
+
+    async def _run() -> None:
+        marks, oi = await _marks_and_oi()
+        if coin not in marks:
+            console.print(f"[red]{coin} is not a listed perp[/red]")
+            raise typer.Exit(1)
+        positions = Registry(registry).positions(coin)
+        liqmap = build(positions, coin, marks[coin], oi[coin])
+        if not liqmap.total_notional:
+            console.print(f"[red]no registry positions in {coin}[/red] -- snapshot first")
+            raise typer.Exit(1)
+
+        rows = [b for b in liqmap.buckets if b.notional > 0]
+        above = [b for b in rows if b.low >= liqmap.mark][:buckets]
+        below = [b for b in rows if b.high < liqmap.mark][-buckets:]
+        peak = max((b.notional for b in above + below), default=1.0)
+
+        table = Table(title=f"{coin} liquidation map   mark {liqmap.mark:g}")
+        for col in ("price", "%", "notional", "", "cross"):
+            table.add_column(col, justify="right")
+        for bucket in reversed(above):
+            _map_row(table, bucket, liqmap.mark, peak)
+        table.add_row("[bold]mark[/bold]", "", "", f"[bold]{liqmap.mark:g}[/bold]", "")
+        for bucket in reversed(below):
+            _map_row(table, bucket, liqmap.mark, peak)
+        console.print(table)
+
+        bands = ", ".join(f"{b:.1%} imb {liqmap.imbalance(b):+.2f}" for b in sorted(liqmap.up))
+        console.print(
+            f"coverage [bold]{liqmap.coverage:.1%}[/bold] of venue position notional "
+            f"(OI x{OI_SIDES:g}) · {liqmap.positions} positions "
+            f"({liqmap.published_frac:.0%} published, {liqmap.skipped} unplaceable)"
+        )
+        console.print(f"{bands}")
+
+    asyncio.run(_run())
+
+
+def _map_row(table, bucket, mark: float, peak: float) -> None:
+    mid = (bucket.low + bucket.high) / 2
+    distance = (mid - mark) / mark
+    bar = "█" * max(1, int(24 * bucket.notional / peak))
+    cross = bucket.cross_notional / bucket.notional if bucket.notional else 0
+    table.add_row(
+        f"{mid:g}", f"{distance:+.2%}", f"${bucket.notional / 1e6:,.1f}M", bar, f"{cross:.0%}"
+    )
+
+
+@gate_app.command("map")
+def gate_map(
+    coins: Annotated[str, typer.Option("--coins")] = "BTC,ETH,SOL",
+    min_coverage: float = 0.25,
+    registry: RegistryOpt = REGISTRY,
+    ledger: LedgerOpt = LEDGER,
+) -> None:
+    """Run gate `map`: coverage, derivation fidelity, and predictive power."""
+    from nat2.core.registry import Registry
+    from nat2.features.liqmap import build
+    from nat2.gates import map as gate
+
+    async def _run() -> None:
+        marks, oi = await _marks_and_oi()
+        reg = Registry(registry)
+        maps = [
+            build(reg.positions(c), c, marks[c], oi[c])
+            for c in (x.strip() for x in coins.split(","))
+            if c in marks
+        ]
+        verdict, checks = gate.run(reg, maps, Ledger(ledger), min_coverage=min_coverage)
+        table = Table(title="gate map")
+        for col in ("", "coin", "check", "detail"):
+            table.add_column(col, overflow="fold")
+        for check in checks:
+            mark = "[green]PASS[/green]" if check.passed else "[red]FAIL[/red]"
+            table.add_row(mark, check.stream, check.name, check.detail)
+        console.print(table)
+        console.print(
+            "[bold green]gate map PASS[/bold green]"
+            if verdict.passed
+            else "[bold red]gate map FAIL[/bold red] -- recorded; downstream will refuse"
+        )
+        raise typer.Exit(0 if verdict.passed else 1)
+
+    asyncio.run(_run())
 
 
 @log_app.command("verify")

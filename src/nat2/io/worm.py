@@ -66,6 +66,7 @@ def sha256_file(path: Path) -> tuple[str, int]:
 
 
 def read_manifest(root: Path, stream: str | None = None) -> list[ManifestEntry]:
+    root = Path(root)
     path = root / MANIFEST
     if not path.exists():
         return []
@@ -81,6 +82,7 @@ def read_manifest(root: Path, stream: str | None = None) -> list[ManifestEntry]:
 
 def read_records(root: Path, stream: str, since_ns: int | None = None):
     """Yield records for a stream in file order, including the open file."""
+    root = Path(root)
     dec = zstandard.ZstdDecompressor()
     for path in sorted((root / stream).rglob(f"*{SUFFIX}")):
         with path.open("rb") as fh, dec.stream_reader(fh) as reader:

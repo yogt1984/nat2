@@ -79,7 +79,9 @@ Streams: `trades`, `l2Book`, asset contexts (mark/oracle/funding/OI), `userFills
 node-data fills for backfill, `meta` for the universe, HLP/vault state. No other venue appears.
 
 Storage: append-only `ndjson.zst` (WORM) → Parquet → DuckDB views; polars for math; SQLite for
-mutable state only.
+mutable state only. A file, once closed, is checksummed into a manifest and never reopened — a
+restart inside the same hour starts a new part, so a changed digest always means corruption and
+never merely a bounced daemon.
 
 ---
 

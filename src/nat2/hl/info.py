@@ -15,25 +15,44 @@ from nat2.hl.ratelimit import WeightBudget, weight_of
 from nat2.hl.schemas import INFO_URL, INFO_URL_TESTNET
 
 
+MAX_ATTEMPTS = 4
+# A 429 means our model of the limit is wrong, so back off past the whole
+# sliding window rather than retrying inside it.
+THROTTLED_BACKOFF_S = 61.0
+
+
 class InfoClient:
-    def __init__(self, budget: WeightBudget, testnet: bool = False, timeout: float = 10.0):
+    def __init__(self, budget: WeightBudget, testnet: bool = False, timeout: float = 30.0):
         self.url = INFO_URL_TESTNET if testnet else INFO_URL
         self.budget = budget
+        self.throttled = 0
         self._client = httpx.AsyncClient(timeout=timeout)
 
     async def post(self, info_type: str, **body) -> object:
-        await self.budget.acquire_async(weight_of(info_type))
         payload = {"type": info_type, **body}
         last: Exception | None = None
-        for attempt in range(3):
+        for attempt in range(MAX_ATTEMPTS):
+            await self.budget.acquire_async(weight_of(info_type))
             try:
                 resp = await self._client.post(self.url, json=payload)
                 resp.raise_for_status()
                 return resp.json()
+            except httpx.HTTPStatusError as exc:
+                last = exc
+                if exc.response.status_code != 429:
+                    await asyncio.sleep(0.5 * 2**attempt)
+                    continue
+                # Our accounting says there was room, so the server disagrees
+                # with our model of the limit -- wait out the whole window
+                # rather than hammering it with a short backoff.
+                retry_after = exc.response.headers.get("retry-after")
+                delay = float(retry_after) if retry_after else THROTTLED_BACKOFF_S
+                self.throttled += 1
+                await asyncio.sleep(delay)
             except (httpx.HTTPError, ValueError) as exc:
                 last = exc
                 await asyncio.sleep(0.5 * 2**attempt)
-        raise RuntimeError(f"info {info_type} failed after 3 attempts: {last}")
+        raise RuntimeError(f"info {info_type} failed after {MAX_ATTEMPTS} attempts: {last}")
 
     async def meta(self) -> dict:
         return await self.post("meta")

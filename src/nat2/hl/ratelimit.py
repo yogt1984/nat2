@@ -94,3 +94,46 @@ class WeightBudget:
     def headroom(self) -> float:
         with self._lock:
             return 1.0 - self._spent(time.monotonic()) / self.limit
+
+
+class SharedWeightBudget(WeightBudget):
+    """Weight budget shared across processes.
+
+    HL's limit is per IP, not per process, so an in-memory budget lets two
+    commands run back to back and collectively blow through it -- which is
+    exactly how `nat2 gate map` earned a 429 immediately after `nat2 liq scan`.
+    Spend is journalled to SQLite so every process on this machine draws from
+    one account.
+
+    Uses the wall clock rather than a monotonic one because the record has to
+    mean the same thing to a process that started later.
+    """
+
+    def __init__(self, path, limit: int = IP_WEIGHT_PER_MINUTE, window_s: float = 60.0):
+        super().__init__(limit=limit, window_s=window_s)
+        import sqlite3
+        from pathlib import Path
+
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(self.path) as conn:
+            conn.execute("CREATE TABLE IF NOT EXISTS spend (ts REAL NOT NULL, weight INT)")
+            conn.execute("CREATE INDEX IF NOT EXISTS spend_ts ON spend(ts)")
+
+    def _try(self, weight: int) -> float:
+        import sqlite3
+
+        now = time.time()
+        cutoff = now - self.window_s
+        with sqlite3.connect(self.path, timeout=10.0, isolation_level="IMMEDIATE") as conn:
+            conn.execute("DELETE FROM spend WHERE ts <= ?", (cutoff,))
+            spent = conn.execute("SELECT COALESCE(SUM(weight), 0) FROM spend").fetchone()[0]
+            if spent + weight <= self.limit:
+                conn.execute("INSERT INTO spend VALUES (?, ?)", (now, weight))
+                return 0.0
+            oldest = conn.execute("SELECT MIN(ts) FROM spend").fetchone()[0] or now
+        sleep_for = max(0.05, oldest + self.window_s - now)
+        with self._lock:
+            self.waits += 1
+            self.wait_s += sleep_for
+        return sleep_for

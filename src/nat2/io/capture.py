@@ -51,10 +51,10 @@ class CaptureStats:
 
 
 class Capture:
-    def __init__(self, config: CaptureConfig, on_status=None):
+    def __init__(self, config: CaptureConfig, on_status=None, budget=None):
         self.config = config
         self.stats = CaptureStats()
-        self.budget = WeightBudget()
+        self.budget = budget or WeightBudget()
         self.on_status = on_status
         self.writers: dict[str, WormWriter] = {
             name: WormWriter(config.root, name) for name in config.streams

@@ -199,6 +199,88 @@ def score(
     return result
 
 
+@dataclass
+class PopulationOverlap:
+    """Do the wallets that get liquidated overlap the wallets we map?
+
+    The registry is seeded by equity and by volume -- whoever holds size and
+    whoever trades. Neither is the same population as whoever gets liquidated,
+    which skews small and leveraged. This measures the gap before any work is
+    done to close it.
+
+    Counted two ways on purpose. By wallet, a registry that misses thousands of
+    small forced exits looks useless; by notional, the same registry may still
+    cover the liquidations that actually move price. Per-position scoring lives
+    or dies on the notional number, not the wallet count.
+    """
+
+    events: int = 0
+    wallets: int = 0
+    wallets_in_registry: int = 0
+    wallets_mapped: int = 0
+    notional: float = 0.0
+    notional_in_registry: float = 0.0
+    notional_mapped: float = 0.0
+
+    def _ratio(self, part: float, whole: float) -> float:
+        return part / whole if whole else 0.0
+
+    @property
+    def wallet_frac(self) -> float:
+        return self._ratio(self.wallets_in_registry, self.wallets)
+
+    @property
+    def mapped_wallet_frac(self) -> float:
+        return self._ratio(self.wallets_mapped, self.wallets)
+
+    @property
+    def notional_frac(self) -> float:
+        return self._ratio(self.notional_in_registry, self.notional)
+
+    @property
+    def mapped_notional_frac(self) -> float:
+        return self._ratio(self.notional_mapped, self.notional)
+
+    def summary(self) -> dict:
+        return {
+            "events": self.events,
+            "wallets": self.wallets,
+            "wallet_frac": self.wallet_frac,
+            "mapped_wallet_frac": self.mapped_wallet_frac,
+            "notional": self.notional,
+            "notional_frac": self.notional_frac,
+            "mapped_notional_frac": self.mapped_notional_frac,
+        }
+
+
+def population_overlap(
+    events,
+    registry: set[str],
+    mapped: set[tuple[str, str]],
+) -> PopulationOverlap:
+    """`mapped` is the set of (address, coin) the map made a claim about."""
+    result = PopulationOverlap()
+    seen: dict[str, bool] = {}
+    seen_mapped: dict[str, bool] = {}
+    for event in events:
+        result.events += 1
+        result.notional += event.notional
+        user = event.liquidated_user
+        in_registry = user in registry
+        is_mapped = (user, event.coin) in mapped
+        if in_registry:
+            result.notional_in_registry += event.notional
+        if is_mapped:
+            result.notional_mapped += event.notional
+        # A wallet liquidated five times is one wallet, but five events.
+        seen[user] = seen.get(user, False) or in_registry
+        seen_mapped[user] = seen_mapped.get(user, False) or is_mapped
+    result.wallets = len(seen)
+    result.wallets_in_registry = sum(1 for v in seen.values() if v)
+    result.wallets_mapped = sum(1 for v in seen_mapped.values() if v)
+    return result
+
+
 def method_notional(events) -> dict[str, float]:
     """Liquidated notional split by method.
 

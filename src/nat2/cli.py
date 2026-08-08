@@ -395,6 +395,51 @@ def liquidations_list(
     )
 
 
+@liq_app.command("coverage")
+def liquidations_coverage(
+    registry: RegistryOpt = REGISTRY,
+    ledger: LedgerOpt = LEDGER,
+) -> None:
+    """Do the wallets that get liquidated overlap the wallets we map?
+
+    The measurement that decides whether per-position scoring can ever work,
+    or whether `gate map` has to fall back to cluster-level scoring. Each run
+    is appended to the ledger, so the fraction is tracked over time rather
+    than judged from one scan.
+    """
+    from nat2.core.registry import Registry
+    from nat2.features.liqmath import effective
+    from nat2.features.liquidations import population_overlap
+
+    reg = Registry(registry)
+    events = reg.liquidations()
+    if not events:
+        console.print("[dim]no liquidations recorded -- run `nat2 liq scan`[/dim]")
+        raise typer.Exit(1)
+
+    addresses = set(reg.addresses())
+    mapped = {
+        (p.address, p.coin) for p in reg.positions() if (effective(p)[0] or 0) > 0
+    }
+    overlap = population_overlap(events, addresses, mapped)
+
+    table = Table(title="liquidated population vs registry")
+    for col in ("measure", "by wallet", "by notional"):
+        table.add_column(col, justify="right")
+    table.add_row("in registry", f"{overlap.wallet_frac:.1%}", f"{overlap.notional_frac:.1%}")
+    table.add_row("mapped (had a claimed price)",
+                  f"{overlap.mapped_wallet_frac:.1%}", f"{overlap.mapped_notional_frac:.1%}")
+    console.print(table)
+    console.print(
+        f"{overlap.events} liquidation(s), {overlap.wallets} distinct wallet(s), "
+        f"${overlap.notional:,.0f} notional"
+    )
+    console.print(
+        "[dim]per-position scoring lives on the notional number, not the wallet count[/dim]"
+    )
+    Ledger(ledger).append("observation", {"name": "liq_population", **overlap.summary()})
+
+
 @app.command("map")
 def map_show(
     coin: str,

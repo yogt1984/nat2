@@ -50,6 +50,56 @@ def _budget() -> SharedWeightBudget:
     return SharedWeightBudget(BUDGET)
 
 
+def command_summaries() -> list[tuple[str, str]]:
+    """(command path, one-line summary) for every leaf command.
+
+    Walked out of the CLI itself rather than maintained by hand, so it cannot
+    drift: a command added without a docstring shows up as an empty summary,
+    and the test suite fails on it.
+    """
+    found: list[tuple[str, str]] = []
+
+    def walk(instance: typer.Typer, prefix: list[str]) -> None:
+        for command in instance.registered_commands:
+            name = command.name or command.callback.__name__.replace("_", "-")
+            text = (command.help or command.callback.__doc__ or "").strip()
+            found.append((
+                " ".join(prefix + [name]),
+                text.splitlines()[0].strip() if text else "",
+            ))
+        for group in instance.registered_groups:
+            walk(group.typer_instance, prefix + [group.name])
+
+    walk(app, [])
+    return sorted(found)
+
+
+@app.command("help")
+def help_command(
+    paths: Annotated[bool, typer.Option("--paths", help="bare command paths, for scripts")] = False,
+) -> None:
+    """Every command and what it does, in one line each."""
+    summaries = command_summaries()
+    if paths:
+        for path, _ in summaries:
+            print(path)
+        return
+    groups: dict[str, list[tuple[str, str]]] = {}
+    for path, summary in summaries:
+        groups.setdefault(path.split(" ")[0] if " " in path else "", []).append((path, summary))
+    width = max((len(p) for p, _ in summaries), default=0)
+    console.print("[bold]nat2[/bold] — Hyperliquid research and execution engine\n")
+    for group in sorted(groups):
+        for path, summary in groups[group]:
+            # soft_wrap: a one-liner that wraps mid-word is not a one-liner.
+            console.print(f"  [bold cyan]{path:<{width}}[/bold cyan]  {summary}", soft_wrap=True)
+        console.print("")
+    console.print(
+        "[dim]gates before models: every command downstream of a gate refuses to run "
+        "while that gate is missing, stale or FAIL[/dim]"
+    )
+
+
 def _streams(spec: str) -> list[str]:
     names = [s.strip() for s in spec.split(",") if s.strip()]
     unknown = [n for n in names if n not in STREAMS]
@@ -470,6 +520,7 @@ def cycle(
     wallet_limit: Annotated[int, typer.Option(help="0 = whole registry")] = 0,
     once: Annotated[bool, typer.Option("--once", help="run due jobs and exit")] = False,
     force: Annotated[bool, typer.Option("--force", help="with --once, ignore intervals")] = False,
+    root: RootOpt = RAW,
     registry: RegistryOpt = REGISTRY,
     ledger: LedgerOpt = LEDGER,
     testnet: bool = False,
@@ -488,6 +539,7 @@ def cycle(
         ledger_path=ledger,
         snapshot_interval_ns=parse_window(snapshot_every),
         scan_interval_ns=parse_window(scan_every),
+        raw_root=root,
         observers=observers,
         wallet_limit=wallet_limit,
         testnet=testnet,

@@ -81,13 +81,28 @@ def read_manifest(root: Path, stream: str | None = None) -> list[ManifestEntry]:
 
 
 def read_records(root: Path, stream: str, since_ns: int | None = None):
-    """Yield records for a stream in file order, including the open file."""
+    """Yield records for a stream in file order, including the open file.
+
+    The current hour's file is being written concurrently, so its tail is
+    routinely a half-written record. A complete record always ends in a
+    newline, so an unterminated remainder is incomplete rather than corrupt
+    and is skipped -- it will be read whole on the next pass. A decode failure
+    on a *terminated* line is real corruption and still raises, which is what
+    `gate feed` reports on.
+    """
     root = Path(root)
     dec = zstandard.ZstdDecompressor()
     for path in sorted((root / stream).rglob(f"*{SUFFIX}")):
         with path.open("rb") as fh, dec.stream_reader(fh) as reader:
             buf = b""
-            while chunk := reader.read(1 << 20):
+            while True:
+                try:
+                    chunk = reader.read(1 << 20)
+                except zstandard.ZstdError:
+                    # Frame still open: the writer has not flushed it yet.
+                    break
+                if not chunk:
+                    break
                 buf += chunk
                 *lines, buf = buf.split(b"\n")
                 for line in lines:
@@ -96,10 +111,6 @@ def read_records(root: Path, stream: str, since_ns: int | None = None):
                     rec = json.loads(line)
                     if since_ns is None or rec["t_ingest"] >= since_ns:
                         yield rec
-            if buf.strip():
-                rec = json.loads(buf)
-                if since_ns is None or rec["t_ingest"] >= since_ns:
-                    yield rec
 
 
 class WormWriter:

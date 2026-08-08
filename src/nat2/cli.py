@@ -13,6 +13,7 @@ from rich.table import Table
 
 from nat2.core.clock import NS, parse_window, to_dt
 from nat2.core.guard import latest as latest_verdict
+from nat2.core.paths import home, resolved
 from nat2.hl.info import InfoClient
 from nat2.hl.ratelimit import SharedWeightBudget
 from nat2.hl.schemas import STREAMS
@@ -34,10 +35,13 @@ app.add_typer(log_app, name="log")
 
 console = Console()
 
-RAW = Path("data/raw")
-PARQUET = Path("data/parquet")
-LEDGER = Path("data/ledger.jsonl")
-BUDGET = Path("data/ratelimit.sqlite")
+# Absolute, resolved once at import. Relative defaults would silently point at
+# whatever directory the command happened to be run from.
+HOME = home()
+RAW = HOME / "data/raw"
+PARQUET = HOME / "data/parquet"
+LEDGER = HOME / "data/ledger.jsonl"
+BUDGET = HOME / "data/ratelimit.sqlite"
 DEFAULT_STREAMS = "hl.trades,hl.l2book,hl.assetctxs"
 
 RootOpt = Annotated[Path, typer.Option("--root", help="WORM store root")]
@@ -94,10 +98,12 @@ def help_command(
             # soft_wrap: a one-liner that wraps mid-word is not a one-liner.
             console.print(f"  [bold cyan]{path:<{width}}[/bold cyan]  {summary}", soft_wrap=True)
         console.print("")
+    path, how = resolved()
     console.print(
         "[dim]gates before models: every command downstream of a gate refuses to run "
         "while that gate is missing, stale or FAIL[/dim]"
     )
+    console.print(f"[dim]data home: {path}  ({how}; override with NAT2_HOME)[/dim]")
 
 
 def _streams(spec: str) -> list[str]:
@@ -273,7 +279,7 @@ def gate_status(ledger: LedgerOpt = LEDGER) -> None:
     console.print(table)
 
 
-REGISTRY = Path("data/registry.sqlite")
+REGISTRY = HOME / "data/registry.sqlite"
 RegistryOpt = Annotated[Path, typer.Option("--registry", help="wallet registry database")]
 
 
@@ -363,6 +369,8 @@ def wallets_status(registry: RegistryOpt = REGISTRY) -> None:
     counts = reg.wallet_count()
     snapshot = reg.last_snapshot()
     age = reg.position_age_ns()
+    path, how = resolved()
+    console.print(f"[dim]data home: {path} ({how})[/dim]")
     console.print(f"wallets: {sum(counts.values())} ({counts})")
     if snapshot:
         console.print(

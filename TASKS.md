@@ -133,4 +133,3 @@ Open items, each needing a test that fails loudly if the answer moves:
 - Clock skew flipped sign between capture runs (−196ms then +395ms). Within the
   2s tolerance, but a ~600ms shift over minutes is unexplained — NTP discipline
   or HL timestamp semantics.
-- Branch is still named `feat/m0-capture` and now carries M1 as well.

@@ -30,12 +30,29 @@ Pick one, on evidence:
 - **Score at cluster level instead of per-position** — did liquidations land in
   the price buckets the map marked, regardless of whose they were. Weaker claim,
   but answerable with the registry as it stands.
-- **Measure the ceiling first** (cheap, do this before either): over a week of
-  scans, what fraction of liquidated wallets ever appear in the registry? If it
-  is near zero, per-position scoring is dead and cluster scoring is the design.
+- ~~**Measure the ceiling first**~~ — built (`nat2 liq coverage`, appended to the
+  ledger each run so the fraction is a series, not one reading). First reading:
+  **2.9% of liquidated wallets are in the registry, but 21.9% of liquidated
+  notional.** The registry misses the long tail of small forced exits and
+  catches a fifth of the notional, so per-position scoring is not obviously dead.
+
+**But the reading is confounded, and cannot be believed yet.** `mapped` is 0.0%
+on both measures because a liquidated wallet no longer holds the position — a
+snapshot taken *after* a liquidation shows nothing to have predicted. Until
+snapshots reliably precede liquidations, this measurement cannot separate
+"different populations" from "we looked too late".
+
+Settling it needs the snapshot-then-observe cycle below, not more analysis.
+
+## 1c. Schedule the cycle — what actually resolves 1b
+
+- Snapshot the registry every ~6h (a sweep costs ~5 min and the whole budget).
+- `nat2 liq scan` every ~1h; events are deduped by trade id, so overlap is free.
+- Re-run `nat2 liq coverage` after each scan and watch `mapped_notional_frac`
+  climb from zero — or fail to.
 
 This also qualifies the map itself: 31% coverage *by notional* may correspond to
-far less than 31% of liquidation *events*. Coverage should be reported both ways.
+far less than 31% of liquidation *events*. Coverage is now reported both ways.
 
 ## 2. Run capture continuously — unblocks everything
 

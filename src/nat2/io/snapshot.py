@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 
 from nat2.core.clock import now_ns
+from nat2.core.reconstruct import drift
 from nat2.core.registry import Registry
 from nat2.features.liqmath import Position
 from nat2.hl.info import InfoClient
@@ -81,6 +82,11 @@ async def sweep(
             on_progress(done, len(addresses))
 
     await asyncio.gather(*(fetch(a) for a in addresses))
+    # The only check on tape reconstruction: the public trades channel carries
+    # no per-fill checkpoint, so a fresh sweep is where drift becomes visible.
+    # Measured before the replace, because the replace is what destroys it.
+    carried = registry.positions(source="derived")
+    drift_stats = drift(carried, positions) if carried else {"compared": 0}
     registry.replace_positions([(p, "published") for p in positions])
     snapshot_id = registry.record_snapshot(
         started, len(addresses), holders, len(positions), errors
@@ -92,4 +98,5 @@ async def sweep(
         "positions": len(positions),
         "errors": errors,
         "elapsed_s": (now_ns() - started) / 1e9,
+        "drift": drift_stats,
     }

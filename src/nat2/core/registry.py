@@ -143,12 +143,75 @@ class Registry:
             )
         return len(payload)
 
-    def positions(self, coin: str | None = None) -> list[Position]:
+    def upsert_positions(self, positions: list[tuple[Position, str]]) -> int:
+        """Insert or update without clearing the table.
+
+        Unlike `replace_positions`, this is how tape-derived changes land: a
+        wallet absent from this batch simply did not trade, and must keep the
+        position we last observed rather than vanishing from the map.
+        """
+        ts = now_ns()
+        payload = [
+            (p.address, p.coin, p.szi, p.mark, p.max_leverage, p.margin_type,
+             p.account_value, p.maint_margin, p.isolated_margin, p.liquidation_px,
+             source, ts)
+            for p, source in positions
+        ]
+        with closing(self._connect()) as conn, conn:
+            conn.executemany(
+                "INSERT INTO positions VALUES (?,?,?,?,?,?,?,?,?,?,?,?)"
+                " ON CONFLICT(address, coin) DO UPDATE SET"
+                " szi=excluded.szi, mark=excluded.mark, max_leverage=excluded.max_leverage,"
+                " margin_type=excluded.margin_type, account_value=excluded.account_value,"
+                " maint_margin=excluded.maint_margin, isolated_margin=excluded.isolated_margin,"
+                " liquidation_px=excluded.liquidation_px, source=excluded.source,"
+                " t_ingest=excluded.t_ingest",
+                payload,
+            )
+        return len(payload)
+
+    def delete_positions(self, keys: list[tuple[str, str]]) -> int:
+        with closing(self._connect()) as conn, conn:
+            conn.executemany("DELETE FROM positions WHERE address=? AND coin=?", keys)
+        return len(keys)
+
+    def source_counts(self) -> dict[str, int]:
+        with closing(self._connect()) as conn:
+            rows = conn.execute("SELECT source, COUNT(*) n FROM positions GROUP BY source")
+            return {r["source"]: r["n"] for r in rows}
+
+    # --- watermarks ------------------------------------------------------
+
+    def ensure_state_table(self) -> None:
+        with closing(self._connect()) as conn, conn:
+            conn.execute("CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value TEXT)")
+
+    def get_state(self, key: str, default=None):
+        self.ensure_state_table()
+        with closing(self._connect()) as conn:
+            row = conn.execute("SELECT value FROM state WHERE key = ?", (key,)).fetchone()
+        return row["value"] if row else default
+
+    def set_state(self, key: str, value) -> None:
+        self.ensure_state_table()
+        with closing(self._connect()) as conn, conn:
+            conn.execute(
+                "INSERT INTO state VALUES (?,?) ON CONFLICT(key) DO UPDATE SET"
+                " value=excluded.value",
+                (key, str(value)),
+            )
+
+    def positions(self, coin: str | None = None, source: str | None = None) -> list[Position]:
         query = "SELECT * FROM positions"
-        params: list = []
+        clauses, params = [], []
         if coin:
-            query += " WHERE coin = ?"
+            clauses.append("coin = ?")
             params.append(coin)
+        if source:
+            clauses.append("source = ?")
+            params.append(source)
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
         with closing(self._connect()) as conn:
             return [
                 Position(

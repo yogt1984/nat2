@@ -43,6 +43,8 @@ class CycleConfig:
     ledger_path: Path
     snapshot_interval_ns: int
     scan_interval_ns: int
+    replay_interval_ns: int = 5 * 60 * NS
+    raw_root: Path = Path("data/raw")
     observers: int = 40
     wallet_limit: int = 0
     testnet: bool = False
@@ -57,6 +59,10 @@ class Cycle:
         self.on_event = on_event or (lambda *_: None)
         self.store = JobStore(self.registry)
         self.jobs = {
+            # Replay first and often: it is free (no API weight, only captured
+            # tape) and it is what keeps the map from going stale between the
+            # expensive sweeps.
+            "replay": self.store.load("replay", config.replay_interval_ns),
             "snapshot": self.store.load("snapshot", config.snapshot_interval_ns),
             "scan": self.store.load("scan", config.scan_interval_ns),
         }
@@ -68,7 +74,7 @@ class Cycle:
     async def run_once(self, force: bool = False) -> dict:
         """One pass. Returns what ran; anything not due is simply not run."""
         results: dict = {}
-        for name in ("snapshot", "scan"):
+        for name in ("replay", "snapshot", "scan"):
             job = self.jobs[name]
             if not force and not job.due():
                 continue
@@ -98,6 +104,11 @@ class Cycle:
                 self.on_event(name, result)
             with contextlib.suppress(asyncio.TimeoutError):
                 await asyncio.wait_for(self._stop.wait(), timeout=TICK_S)
+
+    async def _run_replay(self) -> dict:
+        from nat2.io.replay import replay
+
+        return replay(self.registry, self.config.raw_root)
 
     async def _run_snapshot(self) -> dict:
         addresses = self.registry.addresses(limit=self.config.wallet_limit or None)

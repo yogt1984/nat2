@@ -440,6 +440,28 @@ def liquidations_coverage(
     Ledger(ledger).append("observation", {"name": "liq_population", **overlap.summary()})
 
 
+@wallets_app.command("replay")
+def wallets_replay(
+    reset: Annotated[bool, typer.Option("--reset", help="replay the whole store")] = False,
+    root: RootOpt = RAW,
+    registry: RegistryOpt = REGISTRY,
+) -> None:
+    """Fold captured tape into the registry, so the map is not six hours stale.
+
+    Only tape newer than the watermark is applied, so running this twice is a
+    no-op rather than a double count.
+    """
+    from nat2.core.registry import Registry
+    from nat2.io.replay import replay, reset_watermark
+
+    reg = Registry(registry)
+    if reset:
+        reset_watermark(reg)
+    result = replay(reg, root)
+    console.print(json.dumps(result, default=str))
+    console.print(f"positions by source: {reg.source_counts()}")
+
+
 @app.command("cycle")
 def cycle(
     snapshot_every: Annotated[str, typer.Option(help="registry sweep interval")] = "6h",

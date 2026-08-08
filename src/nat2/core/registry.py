@@ -226,6 +226,32 @@ class Registry:
             )
             return cur.lastrowid
 
+    # --- jobs ------------------------------------------------------------
+
+    def ensure_jobs_table(self) -> None:
+        with closing(self._connect()) as conn, conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS jobs ("
+                " name TEXT PRIMARY KEY, last_run_ns INTEGER NOT NULL,"
+                " runs INTEGER NOT NULL, failures INTEGER NOT NULL)"
+            )
+
+    def job(self, name: str) -> dict | None:
+        self.ensure_jobs_table()
+        with closing(self._connect()) as conn:
+            row = conn.execute("SELECT * FROM jobs WHERE name = ?", (name,)).fetchone()
+        return dict(row) if row else None
+
+    def save_job(self, name: str, last_run_ns: int, runs: int, failures: int) -> None:
+        self.ensure_jobs_table()
+        with closing(self._connect()) as conn, conn:
+            conn.execute(
+                "INSERT INTO jobs VALUES (?,?,?,?) ON CONFLICT(name) DO UPDATE SET"
+                " last_run_ns=excluded.last_run_ns, runs=excluded.runs,"
+                " failures=excluded.failures",
+                (name, last_run_ns, runs, failures),
+            )
+
     def last_snapshot(self) -> dict | None:
         with closing(self._connect()) as conn:
             row = conn.execute("SELECT * FROM snapshots ORDER BY id DESC LIMIT 1").fetchone()

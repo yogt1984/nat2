@@ -440,6 +440,57 @@ def liquidations_coverage(
     Ledger(ledger).append("observation", {"name": "liq_population", **overlap.summary()})
 
 
+@app.command("cycle")
+def cycle(
+    snapshot_every: Annotated[str, typer.Option(help="registry sweep interval")] = "6h",
+    scan_every: Annotated[str, typer.Option(help="liquidation scan interval")] = "1h",
+    observers: int = 40,
+    wallet_limit: Annotated[int, typer.Option(help="0 = whole registry")] = 0,
+    once: Annotated[bool, typer.Option("--once", help="run due jobs and exit")] = False,
+    force: Annotated[bool, typer.Option("--force", help="with --once, ignore intervals")] = False,
+    registry: RegistryOpt = REGISTRY,
+    ledger: LedgerOpt = LEDGER,
+    testnet: bool = False,
+) -> None:
+    """Snapshot, then observe. The cycle that makes `gate map` answerable.
+
+    A liquidation only tests the map if the snapshot preceded it, so this runs
+    forever: sweep the registry, scan for liquidations, and record the overlap
+    each pass so `mapped_notional_frac` becomes a series rather than one
+    confounded reading.
+    """
+    from nat2.io.cycle import Cycle, CycleConfig
+
+    config = CycleConfig(
+        registry_path=registry,
+        ledger_path=ledger,
+        snapshot_interval_ns=parse_window(snapshot_every),
+        scan_interval_ns=parse_window(scan_every),
+        observers=observers,
+        wallet_limit=wallet_limit,
+        testnet=testnet,
+    )
+
+    def report(name: str, result: dict) -> None:
+        console.print(f"[dim]{name}:[/dim] {json.dumps(result, default=str)[:200]}")
+
+    async def _run() -> None:
+        runner = Cycle(config, _budget(), on_event=report)
+        console.print(f"[bold]cycle[/bold] {runner.status()}")
+        if once:
+            results = await runner.run_once(force=force)
+            if not results:
+                console.print("[dim]nothing due[/dim]")
+            for name, result in results.items():
+                report(name, result)
+            return
+        console.print("[dim]running until interrupted[/dim]")
+        await runner.run()
+        console.print(f"[dim]stopped -- {runner.status()}[/dim]")
+
+    asyncio.run(_run())
+
+
 @app.command("map")
 def map_show(
     coin: str,

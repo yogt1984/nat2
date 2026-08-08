@@ -11,10 +11,10 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from nat2.core.clock import NS, parse_window
+from nat2.core.clock import NS, parse_window, to_dt
 from nat2.core.guard import latest as latest_verdict
 from nat2.hl.info import InfoClient
-from nat2.hl.ratelimit import WeightBudget
+from nat2.hl.ratelimit import SharedWeightBudget
 from nat2.hl.schemas import STREAMS
 from nat2.ledger.chain import Ledger
 
@@ -24,7 +24,9 @@ audit_app = typer.Typer(no_args_is_help=True, help="Data integrity audits")
 gate_app = typer.Typer(no_args_is_help=True, help="Falsification gates")
 log_app = typer.Typer(no_args_is_help=True, help="Hash-chained ledger")
 wallets_app = typer.Typer(no_args_is_help=True, help="Wallet registry")
+liq_app = typer.Typer(no_args_is_help=True, help="Realized liquidations")
 app.add_typer(wallets_app, name="wallets")
+app.add_typer(liq_app, name="liq")
 app.add_typer(capture_app, name="capture")
 app.add_typer(audit_app, name="audit")
 app.add_typer(gate_app, name="gate")
@@ -35,11 +37,17 @@ console = Console()
 RAW = Path("data/raw")
 PARQUET = Path("data/parquet")
 LEDGER = Path("data/ledger.jsonl")
+BUDGET = Path("data/ratelimit.sqlite")
 DEFAULT_STREAMS = "hl.trades,hl.l2book,hl.assetctxs"
 
 RootOpt = Annotated[Path, typer.Option("--root", help="WORM store root")]
 StreamsOpt = Annotated[str, typer.Option("--streams", help="comma-separated stream names")]
 LedgerOpt = Annotated[Path, typer.Option("--ledger", help="hash-chained ledger path")]
+
+
+def _budget() -> SharedWeightBudget:
+    """One weight account per machine -- HL limits by IP, not by process."""
+    return SharedWeightBudget(BUDGET)
 
 
 def _streams(spec: str) -> list[str]:
@@ -71,7 +79,7 @@ def capture_hl(
     async def _run() -> None:
         selected = [c.strip() for c in coins.split(",") if c.strip()]
         if all_coins:
-            info = InfoClient(WeightBudget(), testnet=testnet)
+            info = InfoClient(_budget(), testnet=testnet)
             selected = await info.universe(min_day_volume=min_volume)
             await info.aclose()
         config = CaptureConfig(
@@ -126,7 +134,7 @@ def universe(
     """List HL perps, rebuilt from `meta` -- never a hardcoded coin list."""
 
     async def _run() -> None:
-        info = InfoClient(WeightBudget(), testnet=testnet)
+        info = InfoClient(_budget(), testnet=testnet)
         meta, ctxs = await info.meta_and_asset_ctxs()
         await info.aclose()
         rows = [
@@ -221,7 +229,7 @@ RegistryOpt = Annotated[Path, typer.Option("--registry", help="wallet registry d
 
 async def _marks_and_oi(testnet: bool = False) -> tuple[dict, dict]:
     """Mark price and OI notional per coin, from one request."""
-    info = InfoClient(WeightBudget(), testnet=testnet)
+    info = InfoClient(_budget(), testnet=testnet)
     meta, ctxs = await info.meta_and_asset_ctxs()
     await info.aclose()
     marks, oi = {}, {}
@@ -280,7 +288,7 @@ def wallets_snapshot(
         if not addresses:
             console.print("[red]registry is empty -- run `nat2 wallets seed` first[/red]")
             raise typer.Exit(1)
-        info = InfoClient(WeightBudget(), testnet=testnet)
+        info = InfoClient(_budget(), testnet=testnet)
         console.print(f"sweeping {len(addresses)} wallets …")
         result = await sweep(
             reg, info, addresses,
@@ -313,6 +321,78 @@ def wallets_status(registry: RegistryOpt = REGISTRY) -> None:
             f"{snapshot['errors']} error(s)"
         )
     console.print(f"positions age: {age / NS / 60:.1f}m" if age else "positions: none")
+
+
+@liq_app.command("scan")
+def liquidations_scan(
+    observers: Annotated[int, typer.Option(help="highest-volume wallets to read")] = 60,
+    registry: RegistryOpt = REGISTRY,
+    testnet: bool = False,
+) -> None:
+    """Collect realized liquidations from observer wallets' fills.
+
+    Liquidations are seen through whoever took the other side, so a handful of
+    high-volume wallets observes far more of them than the whole registry would.
+    """
+    from nat2.core.registry import Registry
+    from nat2.io.liqscan import candidate_observers, scan
+
+    async def _run() -> None:
+        reg = Registry(registry)
+        addresses = candidate_observers(reg, observers)
+        if not addresses:
+            console.print("[red]registry is empty -- run `nat2 wallets seed` first[/red]")
+            raise typer.Exit(1)
+        info = InfoClient(_budget(), testnet=testnet)
+        console.print(f"scanning {len(addresses)} observers …")
+        result = await scan(
+            reg, info, addresses,
+            on_progress=lambda d, n: console.print(f"[dim]  … {d}/{n}[/dim]"),
+        )
+        await info.aclose()
+        console.print(
+            f"{result['unique_events']} unique liquidation(s) "
+            f"({result['new_events']} new) from "
+            f"{result['productive_observers']}/{result['observers']} productive observers, "
+            f"{result['errors']} error(s)"
+        )
+
+    asyncio.run(_run())
+
+
+@liq_app.command("list")
+def liquidations_list(
+    limit: int = 20,
+    registry: RegistryOpt = REGISTRY,
+) -> None:
+    """Recent liquidations, and how the observed notional splits by method."""
+    from nat2.core.registry import Registry
+    from nat2.features.liquidations import method_notional
+
+    events = Registry(registry).liquidations()
+    if not events:
+        console.print("[dim]no liquidations recorded -- run `nat2 liq scan`[/dim]")
+        return
+    table = Table(title=f"liquidations ({len(events)} recorded, newest {limit})")
+    for col in ("when", "coin", "liquidated", "mark", "notional", "method", "src"):
+        table.add_column(col, justify="right")
+    for event in events[-limit:]:
+        table.add_row(
+            to_dt(event.t_event).strftime("%m-%d %H:%M:%S"),
+            event.coin,
+            event.liquidated_user[:10],
+            f"{event.mark_px:g}",
+            f"${event.notional:,.0f}",
+            event.method,
+            event.source[:4],
+        )
+    console.print(table)
+    split = method_notional(events)
+    total = sum(split.values()) or 1.0
+    console.print(
+        " · ".join(f"{k} ${v / 1e6:.2f}M ({v / total:.0%})" for k, v in sorted(split.items()))
+        + "   [dim](backstop = what the book could not absorb)[/dim]"
+    )
 
 
 @app.command("map")

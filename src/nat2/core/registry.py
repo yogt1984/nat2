@@ -41,6 +41,20 @@ CREATE TABLE IF NOT EXISTS positions (
     PRIMARY KEY (address, coin)
 );
 CREATE INDEX IF NOT EXISTS positions_coin ON positions(coin);
+CREATE TABLE IF NOT EXISTS liquidations (
+    tid             INTEGER PRIMARY KEY,   -- one row per trade id, whoever saw it
+    t_event         INTEGER NOT NULL,
+    coin            TEXT NOT NULL,
+    liquidated_user TEXT NOT NULL,
+    mark_px         REAL NOT NULL,
+    method          TEXT NOT NULL,
+    px              REAL NOT NULL,
+    sz              REAL NOT NULL,
+    observer        TEXT NOT NULL,
+    source          TEXT NOT NULL,
+    t_ingest        INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS liquidations_time ON liquidations(t_event);
 CREATE TABLE IF NOT EXISTS snapshots (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     started INTEGER, finished INTEGER,
@@ -142,6 +156,55 @@ class Registry:
                     max_leverage=r["max_leverage"], margin_type=r["margin_type"],
                     account_value=r["account_value"], maint_margin=r["maint_margin"],
                     isolated_margin=r["isolated_margin"], liquidation_px=r["liquidation_px"],
+                )
+                for r in conn.execute(query, params)
+            ]
+
+    def positions_ts(self) -> int | None:
+        """When the current positions were observed.
+
+        One sweep stamps every row identically, so this is the map's epoch --
+        and the cutoff that stops a liquidation from being 'predicted' by a
+        map built after it happened.
+        """
+        with closing(self._connect()) as conn:
+            row = conn.execute("SELECT MAX(t_ingest) t FROM positions").fetchone()
+        return row["t"] if row and row["t"] else None
+
+    # --- liquidations ----------------------------------------------------
+
+    def record_liquidations(self, events) -> int:
+        """Insert new events. Existing trade ids are kept, never overwritten."""
+        ts = now_ns()
+        payload = [
+            (e.tid, e.t_event, e.coin, e.liquidated_user, e.mark_px, e.method,
+             e.px, e.sz, e.observer, e.source, ts)
+            for e in events
+        ]
+        with closing(self._connect()) as conn, conn:
+            before = conn.execute("SELECT COUNT(*) n FROM liquidations").fetchone()["n"]
+            conn.executemany(
+                "INSERT OR IGNORE INTO liquidations VALUES (?,?,?,?,?,?,?,?,?,?,?)", payload
+            )
+            after = conn.execute("SELECT COUNT(*) n FROM liquidations").fetchone()["n"]
+        return after - before
+
+    def liquidations(self, since_ns: int | None = None):
+        from nat2.features.liquidations import LiquidationEvent
+
+        query = "SELECT * FROM liquidations"
+        params: list = []
+        if since_ns is not None:
+            query += " WHERE t_event > ?"
+            params.append(since_ns)
+        query += " ORDER BY t_event"
+        with closing(self._connect()) as conn:
+            return [
+                LiquidationEvent(
+                    tid=r["tid"], t_event=r["t_event"], coin=r["coin"],
+                    liquidated_user=r["liquidated_user"], mark_px=r["mark_px"],
+                    method=r["method"], px=r["px"], sz=r["sz"],
+                    observer=r["observer"], source=r["source"],
                 )
                 for r in conn.execute(query, params)
             ]

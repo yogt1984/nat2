@@ -50,6 +50,7 @@ class LiqMap:
     oi_notional: float = 0.0
     positions: int = 0
     skipped: int = 0
+    outside_span: int = 0     # priced, but further from the mark than we looked
 
     @property
     def coverage(self) -> float:
@@ -75,6 +76,7 @@ class LiqMap:
             "oi_sides": OI_SIDES,
             "positions": self.positions,
             "skipped": self.skipped,
+            "outside_span": self.outside_span,
             "published_frac": self.published_frac,
             "notional": self.total_notional,
             "imb": {str(b): self.imbalance(b) for b in self.up},
@@ -87,11 +89,18 @@ def build(
     mark: float,
     oi_notional: float,
     bands: tuple[float, ...] = DEFAULT_BANDS,
-    bucket_pct: float = 0.0025,
+    bucket_pct: float = 0.00125,
+    span: float | None = None,
 ) -> LiqMap:
-    span = max(bands) * 2
+    """`bucket_pct` sets resolution, `span` how far from the mark to look.
+
+    Resolution is a display choice, not a data one: the band totals and the
+    imbalance are computed from each position's exact liquidation price, so
+    they do not change when buckets get finer. Only the histogram does.
+    """
+    span = max(bands) * 2 if span is None else span
     edges = []
-    steps = int(span / bucket_pct)
+    steps = max(1, int(round(span / bucket_pct)))
     for i in range(-steps, steps):
         edges.append((mark * (1 + i * bucket_pct), mark * (1 + (i + 1) * bucket_pct)))
     buckets = [Bucket(low, high) for low, high in edges]
@@ -118,13 +127,20 @@ def build(
             liqmap.skipped += 1
             continue
         liqmap.positions += 1
+        placed = False
         for bucket in buckets:
             if bucket.low <= price < bucket.high:
                 bucket.notional += notional
                 if position.margin_type == "cross":
                     bucket.cross_notional += notional
                 bucket.positions += 1
+                placed = True
                 break
+        if not placed:
+            # Beyond the requested span. Still real, still in the totals -- the
+            # histogram is a window, and a window that hides its own edges
+            # invites the reader to mistake it for the whole picture.
+            liqmap.outside_span += 1
         distance = (price - mark) / mark
         for band in bands:
             if 0 < distance <= band:

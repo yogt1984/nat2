@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from nat2.core.registry import Registry
 from nat2.features.liqmap import OI_SIDES, build
 from nat2.features.liqmath import Position, derive, effective, validate
@@ -117,3 +119,50 @@ def test_gate_map_fails_without_a_snapshot(tmp_path):
     verdict, checks = gate_map.run(registry, [], Ledger(tmp_path / "l.jsonl"))
     assert not verdict.passed
     assert not {c.name: c for c in checks}["positions_fresh"].passed
+
+
+def test_resolution_changes_the_histogram_but_not_the_totals():
+    # Resolution is a display choice. Band totals and imbalance come from each
+    # position's exact price, so they must not move when buckets get finer.
+    positions = [_position(address=f"0x{i}", szi=1.0, liquidation_px=99.0 + i * 0.1)
+                 for i in range(8)]
+    coarse = build(positions, "BTC", 100.0, 1000.0, bucket_pct=0.01)
+    fine = build(positions, "BTC", 100.0, 1000.0, bucket_pct=0.0005)
+    assert coarse.total_notional == fine.total_notional
+    assert coarse.imbalance(0.02) == fine.imbalance(0.02)
+    assert coarse.down[0.02] == fine.down[0.02]
+    # ...but the finer map spreads the same notional over more buckets.
+    assert sum(1 for b in fine.buckets if b.notional) > sum(
+        1 for b in coarse.buckets if b.notional
+    )
+
+
+def test_finer_buckets_never_lose_notional():
+    positions = [_position(address=f"0x{i}", szi=1.0, liquidation_px=99.5) for i in range(3)]
+    fine = build(positions, "BTC", 100.0, 1000.0, bucket_pct=0.0001, span=0.1)
+    assert sum(b.notional for b in fine.buckets) == pytest.approx(fine.total_notional)
+
+
+def test_positions_beyond_the_span_are_counted_not_hidden():
+    # A window that hides its own edges invites the reader to mistake it for
+    # the whole picture.
+    near = _position(address="0xnear", liquidation_px=99.0)
+    far = _position(address="0xfar", liquidation_px=50.0)
+    liqmap = build([near, far], "BTC", 100.0, 1000.0, span=0.05)
+    assert liqmap.outside_span == 1
+    assert liqmap.positions == 2
+    assert liqmap.total_notional == 200.0
+    assert sum(b.notional for b in liqmap.buckets) == 100.0
+    assert liqmap.summary()["outside_span"] == 1
+
+
+def test_span_widens_to_include_a_distant_cluster():
+    far = _position(address="0xfar", liquidation_px=50.0)
+    assert build([far], "BTC", 100.0, 1000.0, span=0.05).outside_span == 1
+    assert build([far], "BTC", 100.0, 1000.0, span=0.60).outside_span == 0
+
+
+def test_degenerate_resolution_still_produces_a_map():
+    liqmap = build([_position(liquidation_px=99.0)], "BTC", 100.0, 1000.0,
+                   bucket_pct=1.0, span=0.05)
+    assert liqmap.buckets and liqmap.total_notional == 100.0

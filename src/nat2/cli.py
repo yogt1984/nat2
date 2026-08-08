@@ -577,7 +577,9 @@ def cycle(
 def map_show(
     coin: str,
     registry: RegistryOpt = REGISTRY,
-    buckets: Annotated[int, typer.Option(help="rows to display each side")] = 8,
+    buckets: Annotated[int, typer.Option(help="rows to display each side")] = 16,
+    resolution: Annotated[float, typer.Option(help="bucket width, percent")] = 0.125,
+    span: Annotated[float, typer.Option(help="how far from mark to look, percent")] = 10.0,
 ) -> None:
     """Liquidation map for one coin, with the coverage number that qualifies it."""
     from nat2.core.registry import Registry
@@ -589,7 +591,10 @@ def map_show(
             console.print(f"[red]{coin} is not a listed perp[/red]")
             raise typer.Exit(1)
         positions = Registry(registry).positions(coin)
-        liqmap = build(positions, coin, marks[coin], oi[coin])
+        liqmap = build(
+            positions, coin, marks[coin], oi[coin],
+            bucket_pct=resolution / 100.0, span=span / 100.0,
+        )
         if not liqmap.total_notional:
             console.print(f"[red]no registry positions in {coin}[/red] -- snapshot first")
             raise typer.Exit(1)
@@ -599,7 +604,10 @@ def map_show(
         below = [b for b in rows if b.high < liqmap.mark][-buckets:]
         peak = max((b.notional for b in above + below), default=1.0)
 
-        table = Table(title=f"{coin} liquidation map   mark {liqmap.mark:g}")
+        table = Table(
+            title=f"{coin} liquidation map   mark {liqmap.mark:g}   "
+                  f"{resolution:g}% buckets, +/-{span:g}%"
+        )
         for col in ("price", "%", "notional", "", "cross"):
             table.add_column(col, justify="right")
         for bucket in reversed(above):
@@ -610,11 +618,19 @@ def map_show(
         console.print(table)
 
         bands = ", ".join(f"{b:.1%} imb {liqmap.imbalance(b):+.2f}" for b in sorted(liqmap.up))
+        shown = sum(1 for b in above) + sum(1 for b in below)
         console.print(
             f"coverage [bold]{liqmap.coverage:.1%}[/bold] of venue position notional "
             f"(OI x{OI_SIDES:g}) · {liqmap.positions} positions "
-            f"({liqmap.published_frac:.0%} published, {liqmap.skipped} unplaceable)"
+            f"({liqmap.published_frac:.0%} published, {liqmap.skipped} unplaceable, "
+            f"{liqmap.outside_span} beyond +/-{span:g}%)"
         )
+        hidden = len(rows) - shown
+        if hidden > 0:
+            console.print(
+                f"[yellow]{hidden} more bucket(s) not shown[/yellow] -- raise --buckets; "
+                "the bars are scaled to the largest bucket displayed, not the largest one"
+            )
         console.print(f"{bands}")
 
     asyncio.run(_run())

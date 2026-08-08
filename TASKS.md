@@ -44,12 +44,23 @@ snapshots reliably precede liquidations, this measurement cannot separate
 
 Settling it needs the snapshot-then-observe cycle below, not more analysis.
 
-## 1c. Schedule the cycle — what actually resolves 1b
+## 1c. ~~Schedule the cycle~~ — built, now running
 
-- Snapshot the registry every ~6h (a sweep costs ~5 min and the whole budget).
-- `nat2 liq scan` every ~1h; events are deduped by trade id, so overlap is free.
-- Re-run `nat2 liq coverage` after each scan and watch `mapped_notional_frac`
-  climb from zero — or fail to.
+`nat2 cycle --snapshot-every 6h --scan-every 1h`. Sweeps the registry, scans for
+liquidations, and appends an overlap reading to the ledger each pass. Last-run
+times persist in SQLite so a restart does not re-trigger the expensive sweep,
+and a job never overlaps itself.
+
+**What to watch:** `nat2 log query --kind observation`. The series answers 1b.
+
+- `mapped_notional_frac` climbing off zero ⇒ per-position scoring works; keep it.
+- Staying at zero while `notional_frac` holds near 22% ⇒ the registry sees the
+  right wallets but never *before* they blow up. Switch `gate map` to
+  cluster-level scoring.
+- `notional_frac` also collapsing ⇒ seed a third registry by liquidation risk.
+
+Needs roughly a day of cycles before the series says anything. Nothing to
+decide until then.
 
 This also qualifies the map itself: 31% coverage *by notional* may correspond to
 far less than 31% of liquidation *events*. Coverage is now reported both ways.

@@ -120,6 +120,14 @@ Open items, each needing a test that fails loudly if the answer moves:
 
 ## Known gaps
 
+- **A partial sweep silently shrinks the map.** `replace_positions` clears the
+  table and rewrites only what was swept, so `nat2 wallets snapshot --limit N`
+  or `nat2 cycle --wallet-limit N` drops coverage without any error — observed
+  live, 31.5% → 11.7% after a 400-wallet test pass. `sweep` should record swept
+  count against registry size so a partial sweep is visible in its own result,
+  and `gate map` should treat a sudden coverage collapse as a distinct failure
+  from genuine low coverage.
+
 - `hl.l2book` cadence is sparser than the 1s hint implies (45 records / 70s
   across 3 coins). Measure properly before `book_thin` depends on it.
 - Clock skew flipped sign between capture runs (−196ms then +395ms). Within the

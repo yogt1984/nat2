@@ -58,7 +58,8 @@ CREATE INDEX IF NOT EXISTS liquidations_time ON liquidations(t_event);
 CREATE TABLE IF NOT EXISTS snapshots (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     started INTEGER, finished INTEGER,
-    wallets INTEGER, holders INTEGER, positions INTEGER, errors INTEGER
+    wallets INTEGER, holders INTEGER, positions INTEGER, errors INTEGER,
+    refused TEXT
 );
 """
 
@@ -279,13 +280,21 @@ class Registry:
 
     # --- snapshots -------------------------------------------------------
 
+    def _ensure_snapshot_columns(self) -> None:
+        with closing(self._connect()) as conn, conn:
+            columns = {r["name"] for r in conn.execute("PRAGMA table_info(snapshots)")}
+            if "refused" not in columns:
+                conn.execute("ALTER TABLE snapshots ADD COLUMN refused TEXT")
+
     def record_snapshot(self, started: int, wallets: int, holders: int,
-                        positions: int, errors: int) -> int:
+                        positions: int, errors: int, refused: str | None = None) -> int:
+        self._ensure_snapshot_columns()
         with closing(self._connect()) as conn, conn:
             cur = conn.execute(
-                "INSERT INTO snapshots (started, finished, wallets, holders, positions, errors)"
-                " VALUES (?,?,?,?,?,?)",
-                (started, now_ns(), wallets, holders, positions, errors),
+                "INSERT INTO snapshots"
+                " (started, finished, wallets, holders, positions, errors, refused)"
+                " VALUES (?,?,?,?,?,?,?)",
+                (started, now_ns(), wallets, holders, positions, errors, refused),
             )
             return cur.lastrowid
 

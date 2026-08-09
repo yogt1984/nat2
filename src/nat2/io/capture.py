@@ -16,10 +16,12 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import signal
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from nat2.core.clock import NS, now_ns
+from nat2.core.errors import reason, top_reasons
 from nat2.hl.info import InfoClient
 from nat2.hl.ratelimit import WeightBudget
 from nat2.hl.schemas import CHANNEL_TO_STREAM, STREAMS
@@ -45,6 +47,9 @@ class CaptureStats:
     written: dict[str, int] = field(default_factory=dict)
     polls: int = 0
     poll_errors: int = 0
+    # Why, not just how many: 2,298 identical failures are one bug, 2,298
+    # different ones are another, and a bare counter cannot tell them apart.
+    poll_failures: Counter = field(default_factory=Counter)
 
     def bump(self, stream: str) -> None:
         self.written[stream] = self.written.get(stream, 0) + 1
@@ -130,9 +135,9 @@ class Capture:
                     writer.write(payload, None, now_ns())
                     self.stats.bump("hl.assetctxs")
                     self.stats.polls += 1
-                except Exception as exc:  # noqa: BLE001
+                except Exception as exc:  # noqa: BLE001 - attributed below
                     self.stats.poll_errors += 1
-                    _ = exc
+                    self.stats.poll_failures[reason(exc)] += 1
                 await asyncio.sleep(self.config.poll_interval_s)
         finally:
             await info.aclose()
@@ -147,6 +152,15 @@ class Capture:
         while not self._stop.is_set():
             await asyncio.sleep(self.config.status_interval_s)
             self.on_status(self)
+
+    def why(self) -> str:
+        """The dominant failure reasons, for the status line."""
+        parts = []
+        if self.stats.poll_failures:
+            parts.append(f"poll: {top_reasons(self.stats.poll_failures)}")
+        if self.ws and self.ws.stats.reasons:
+            parts.append(f"ws: {top_reasons(self.ws.stats.reasons)}")
+        return " | ".join(parts)
 
     @property
     def uptime_s(self) -> float:

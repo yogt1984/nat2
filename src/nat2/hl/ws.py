@@ -10,11 +10,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections import Counter
 from dataclasses import dataclass, field
 
 import websockets
 
 from nat2.core.clock import now_ns
+from nat2.core.errors import reason
 from nat2.hl.schemas import WS_URL, WS_URL_TESTNET
 
 PING_INTERVAL_S = 45.0
@@ -37,7 +39,9 @@ class WsStats:
     frames: int = 0
     reconnects: int = 0
     last_frame_ns: int = 0
-    errors: list[str] = field(default_factory=list)
+    # Counted by reason. 1,737 reconnects in one run said nothing about why;
+    # an unbounded list of strings would only have hidden it differently.
+    reasons: Counter = field(default_factory=Counter)
 
 
 class WsClient:
@@ -74,7 +78,7 @@ class WsClient:
                             try:
                                 msg = json.loads(frame)
                             except json.JSONDecodeError:
-                                self.stats.errors.append("undecodable frame")
+                                self.stats.reasons["undecodable frame"] += 1
                                 continue
                             channel = msg.get("channel")
                             if channel in (None, "pong", "subscriptionResponse"):
@@ -86,7 +90,7 @@ class WsClient:
                 raise
             except Exception as exc:  # noqa: BLE001 - reconnect on anything
                 self.stats.reconnects += 1
-                self.stats.errors.append(f"{type(exc).__name__}: {exc}")
+                self.stats.reasons[reason(exc)] += 1
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 30.0)
 

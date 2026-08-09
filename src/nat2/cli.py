@@ -165,6 +165,9 @@ def _print_status(capture) -> None:
         f"[dim]{capture.uptime_s / 60:6.1f}m | {counts or 'no records yet'}"
         f" | poll err {capture.stats.poll_errors}{extra}[/dim]"
     )
+    why = capture.why()
+    if why:
+        console.print(f"[yellow]  why: {why}[/yellow]")
 
 
 @app.command()

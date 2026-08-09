@@ -133,6 +133,29 @@ our receipt clock — the condition that voids the `t_ingest` guarantee. Well
 inside the 2 s tolerance, but a ~600 ms shift over minutes is unexplained: NTP
 discipline or HL timestamp semantics.
 
+## Modelling
+
+**The Stage A label degenerates: the race never runs.** *(2026-08-09, BTC)*
+Positive rate **0.7%** over 291 labelled rows at a 2h horizon, 0.0% at 30m. The
+cause is not a coding error but a mismatch the design never addressed: mapped
+clusters sit ~0.7–1% from the mark, while BTC one-minute realized vol is ~1.3bp,
+so a two-hour window offers roughly 14bp of travel against a 70bp target. That
+is a five-sigma move, so virtually every outcome is a **timeout**, which the
+binary label records as 0 — indistinguishable from "the opposite barrier won".
+
+The race only measures anything when the target distance is commensurate with
+what the horizon can traverse. Three ways to fix it, none yet chosen:
+
+- Pick the horizon per row from the distance, so `sqrt(h)·sigma ≈ distance`.
+- Restrict targets to clusters within a few sigma of what the horizon allows.
+- Separate timeout from opposite-barrier in the label rather than collapsing
+  both to 0, so the degenerate case is visible in the data instead of inferred
+  from a base rate.
+
+Related and confirmed working: at a 6h horizon the purge removes every training
+row and the evaluation reports **0 folds** rather than producing a result from
+what is left. Ten hours of tape cannot support a six-hour label.
+
 ## Unexplained
 
 - **An unattributed write into the append-only store.** *(2026-08-09 12:53:54)*

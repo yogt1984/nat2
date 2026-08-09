@@ -626,6 +626,87 @@ def _cell(value, fmt: str) -> str:
     return "-" if value is None else fmt.format(value)
 
 
+@app.command("eval")
+def eval_expert(
+    coin: str,
+    horizon: Annotated[str, typer.Option(help="label horizon, e.g. 30m, 4h")] = "1h",
+    interval: Annotated[str, typer.Option(help="bar width")] = "1m",
+    splits: Annotated[int, typer.Option(help="walk-forward folds")] = 5,
+    min_rows: Annotated[int, typer.Option(help="minimum labelled rows to fit")] = 200,
+    root: RootOpt = RAW,
+    registry: RegistryOpt = REGISTRY,
+) -> None:
+    """Score an expert against its baseline, purged walk-forward, net of costs."""
+    from nat2.core.costs import Costs
+    from nat2.core.registry import Registry
+    from nat2.experts.magnet_a import MagnetA, build_dataset
+    from nat2.features.bars import bars, iter_prints, path
+    from nat2.features.context import by_coin, iter_contexts
+    from nat2.features.frame import build as build_frame
+    from nat2.io.mapsnap import STREAM, series
+    from nat2.io.worm import read_records
+    from nat2.validate.evaluate import evaluate
+
+    name = coin.upper()
+    horizon_ns = parse_window(horizon)
+    prints = iter_prints(read_records(root, "hl.trades"))
+    built = bars(prints, parse_window(interval), coin=name)
+    if not built:
+        console.print(f"[red]no captured prints for {name}[/red]")
+        raise typer.Exit(1)
+
+    contexts = by_coin(iter_contexts(read_records(root, "hl.assetctxs"))).get(name, [])
+    maps = series(read_records(root, STREAM), name)
+    events = [e for e in Registry(registry).liquidations() if e.coin == name]
+    rows, stats = build_frame(built, contexts, maps, liquidations=events, coin=name)
+
+    expert = MagnetA(horizon_ns=horizon_ns, min_rows=min_rows)
+    data = build_dataset(rows, {name: path(prints, name)}, horizon_ns, expert.features)
+    console.print(
+        f"frame {stats.rows} rows (map {stats.map_frac:.0%}) -> "
+        f"{len(data)} labelled, positive rate {data.positive_rate:.1%}"
+    )
+    if not len(data):
+        console.print(
+            "[yellow]nothing labelled[/yellow] -- the magnet features need map "
+            "snapshots, which only start accumulating once `nat2 cycle` runs"
+        )
+        raise typer.Exit(1)
+
+    result = evaluate(expert, data, horizon_ns, Costs(), n_splits=splits)
+    verdict = result.verdict()
+
+    table = Table(title=f"{name} eval — {horizon} horizon, {splits} folds")
+    for col in ("", "n", "base rate", "log loss", "brier", "decisions", "hit rate"):
+        table.add_column(col, justify="right")
+    for side in ("expert", "baseline"):
+        row = verdict[side]
+        table.add_row(
+            row["name"], str(row["n"]), f"{row['base_rate']:.1%}",
+            f"{row['log_loss']:.4f}", f"{row['brier']:.4f}",
+            str(row["decision_n"]),
+            "-" if row["decision_hit_rate"] is None else f"{row['decision_hit_rate']:.1%}",
+        )
+    console.print(table)
+    console.print(
+        f"folds {verdict['folds']['folds']} · tested {verdict['folds']['tested_frac']:.0%} · "
+        f"purged {verdict['folds']['purged']} · skipped {verdict['skipped_folds']} · "
+        f"leaked {verdict['leaked']}"
+    )
+    console.print(
+        f"costs {verdict['costs']['round_trip_bps']:.1f}bp round trip "
+        f"(hash {verdict['costs']['hash']}) · threshold {verdict['threshold']:.3f}"
+    )
+    if result.beats_baseline:
+        console.print("[bold green]beats its baseline[/bold green] out of sample")
+    else:
+        console.print(
+            "[bold red]does not beat its baseline[/bold red] -- "
+            "the machinery is not earning its keep, so it does not enter the pool"
+        )
+    raise typer.Exit(0 if result.beats_baseline else 1)
+
+
 @app.command("cycle")
 def cycle(
     snapshot_every: Annotated[str, typer.Option(help="registry sweep interval")] = "6h",

@@ -1,0 +1,146 @@
+# FINDINGS
+
+What measurement established, as distinct from what was designed (`DESIGN.md`)
+or what is planned (`TASKS.md`). Everything here came from running against live
+Hyperliquid mainnet or from the system's own data, and several entries reversed
+a decision that looked obvious beforehand.
+
+Dates are when the measurement was taken. Nothing here is a claim about the
+market — no gate has passed, so the magnet hypothesis remains untested.
+
+---
+
+## Venue mechanics
+
+**The public trade tape carries both counterparty addresses.** *(2026-08-08)*
+Every print on `hl.trades` includes `users: [buyer, seller]`, so the venue's
+entire fill flow is reconstructable from one non-user subscription. `users[0]`
+is the buyer — verified 8/8 by matching `tid` against those wallets' `userFills`.
+`trade.side` is the **aggressor's** side and is *not* either counterparty's
+direction; signing positions from it inverts the map for every passive fill.
+
+**Websocket user tracking caps at 15 per connection.** *(2026-08-08)*
+Subscribing 1,200 registry addresses to `userFills` on one socket: 15 accepted,
+1,185 rejected with `Cannot track more than 15 total users`. A 2,000-wallet
+registry would need ~146 sockets. This killed the planned per-wallet fill
+capture outright — the tape finding above replaced it. REST `userFills` has no
+such cap; it is bounded by request weight only.
+
+**Liquidations are visible from the counterparty, not the victim.**
+*(2026-08-09)* A liquidation fill carries a `liquidation` object naming
+`liquidatedUser`, `markPx` and `method` (`market` | `backstop`) — on the fill of
+whoever took the other side. The liquidated wallet's own fill merely has a `dir`
+beginning `"Liquidated"`. Across 117,485 fills from 70 wallets: **one** had a
+`Liquidated` dir, while **16 of 70 wallets** had taken the other side of
+someone's liquidation. So the cheap observer set is a handful of high-volume
+wallets that absorb forced flow, not the whole registry. No HLP vault address
+was needed.
+
+**`startPosition` is on `userFills` only.** *(2026-08-09)* Not on the public
+tape. So tape-based position reconstruction has **no per-fill checkpoint** and
+cannot verify itself; drift is caught only by reconciling against the next
+sweep. This corrected an earlier claim of mine that reconstruction was
+self-verifying.
+
+**HL publishes both mark and oracle.** The oracle is CEX-derived, so
+`premium = (mark − oracle) / oracle` is a native, exact measure of global
+pressure. This is what makes the single-venue design defensible and what
+removed the planned Binance sidecar.
+
+## Coverage and population
+
+**The leaderboard exposes 41,392 wallets** *(2026-08-07)*, not the ~1,000 the
+existing skills assume.
+
+**Equity and volume select different populations, and both are needed.**
+
+| seed (top 2,000) | share of venue OI | fraction holding any position |
+|---|---|---|
+| account equity | 61% | 28% |
+| weekly volume | 39% | 46% |
+
+Equity finds whoever holds size — the map. Volume finds whoever trades — the
+skill cohort. One seed for both jobs gets one of them wrong.
+
+**Coverage denominator correction.** *(2026-08-07)* HL's `openInterest` counts
+each contract once, so venue-wide position notional is **2× OI notional**. The
+headline "69% coverage" used the naive denominator and was wrong by a factor of
+two. Real figures: **BTC ~30%, ETH ~36%, SOL ~27%.** Still unverified against
+HL docs and still the single number the map is judged by.
+
+**Polling the registry costs a full sweep of the budget.** *(2026-08-07)*
+3,596 wallets: ~5 minutes wall-clock, 15,390 rate-limit waits, 6,041 s of
+accumulated sleep. Polling frequency would have become the map's *resolution*.
+This made reconstruct-from-tape mandatory rather than an optimisation.
+
+**The liquidated population is not the mapped population.** *(2026-08-08)*
+Of 48 observed liquidations: **2.9% of liquidated wallets** were in the
+registry, but **21.9% of liquidated notional** was. The registry misses the long
+tail of small forced exits and catches a fifth of the size — so per-position
+scoring is not obviously dead, since it lives on the notional number.
+
+*Confounded, and not yet believable:* `mapped` reads 0.0% partly because a
+liquidated wallet no longer holds the position, so a snapshot taken afterwards
+had nothing to predict. Separating "different populations" from "we looked too
+late" needs the snapshot-then-observe cycle, not more analysis.
+
+## Liquidation mathematics
+
+**Our derivation does not reproduce HL's published `liquidationPx`.**
+*(2026-08-07, 1,074 cross positions)*
+
+| variant | median relative error | exact (<1e-4) |
+|---|---|---|
+| `marginSummary.accountValue` | 2.8e-2 | 45.5% |
+| `crossMarginSummary.accountValue` | 3.5e-3 | 48.7% |
+| accounts holding no isolated margin | 1.8e-11 | 58% |
+
+`crossMarginSummary` is correct (isolated margin is not available to cross
+liquidation), but the residual is **unexplained**. Prime suspect: size-tiered
+maintenance margin on large positions. Consequence: **HL's published value is
+the source of truth**, and the derivation exists only to carry positions
+forward between sweeps, with its error measured and disclosed on every map card.
+
+## Defects found by running the system
+
+Each was found by live operation, not by review.
+
+| defect | consequence | status |
+|---|---|---|
+| WORM appended to an already-manifested file on restart | a restart became indistinguishable from tampering | fixed — restarts open a new part |
+| `replace_positions([])` on a fully failed sweep | snapshots 4–6 **destroyed the map**; hours of measurement read an empty table while reporting success | fixed — a sweep that learned nothing refuses to publish |
+| `WeightBudget` was per process | `gate map` 429'd immediately after `liq scan`; HL limits per IP | fixed — spend journalled to SQLite |
+| Errors counted, never attributed | 2,298 poll failures and 2,177 sweep failures with the reason discarded | fixed — `core/errors.py` |
+| Bar `available_at` could precede its close by 42 s | a feature could read a bar that had not finished forming | fixed — availability is `max(close, last arrival)` |
+| `read_records` crashed on a half-written tail | replay died while capture was mid-write | fixed — unterminated tail skipped, terminated corruption still raises |
+| Map defaults showed 8 rows at 0.25% | hid the **largest** cluster ($4.4M at −8.44%; $75.9M at −11.05% further out), and rescaled every bar to a false maximum | fixed — resolution/span/depth are options, truncation is reported |
+| `nat2` not on PATH; data paths relative to cwd | from `/tmp`, `nat2 wallets status` reported an **empty registry as fact** | fixed — installed default + resolution reported on every command |
+| Project marker was "any `data/` directory" | matched a stray `/tmp/data` left by an unrelated command | fixed — `.nat2` marker or a nat2 `pyproject.toml` |
+
+## Operational
+
+**Long-running capture degrades.** *(2026-08-09)* After 19.5 hours: 1,737
+websocket reconnects and 2,298 poll errors — a 49% failure rate on
+`metaAndAssetCtxs`, which produced 846 context records where ~4,700 were
+expected. Invisible at the time because errors were counted, not attributed.
+A restart on the same code gave 0 errors and 0 reconnects over the following
+five minutes, so this is accumulated process state rather than a standing API
+problem. Cause still unknown.
+
+**Clock skew flips sign between runs.** Median ingest lag was −196 ms in one
+capture and +395 ms in the next. Negative means HL's timestamp is *ahead* of
+our receipt clock — the condition that voids the `t_ingest` guarantee. Well
+inside the 2 s tolerance, but a ~600 ms shift over minutes is unexplained: NTP
+discipline or HL timestamp semantics.
+
+## Unexplained
+
+- **An unattributed write into the append-only store.** *(2026-08-09 12:53:54)*
+  A one-coin `nat2.liqmap` snapshot appeared 39 s before the first deliberate
+  one. The cycle daemon has no `mapsnap` job row and the tests write only to
+  temp directories, so nothing that ran accounts for it. The record is valid, so
+  nothing is corrupted — but an unattributable write into a WORM store is
+  exactly what this design refuses to shrug at.
+- The liquidation-formula residual (above).
+- The capture degradation cause (above).
+- The clock-skew sign flip (above).

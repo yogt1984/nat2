@@ -195,3 +195,46 @@ def test_top_reasons_summarises_the_dominant_failures():
 @pytest.mark.parametrize("errors,wallets,expected", [(0, 0, True), (1, 1, True), (0, 1, False)])
 def test_refusal_is_decided_only_by_counts(errors, wallets, expected):
     assert (refusal(wallets, 0, errors) is not None) is expected
+
+
+# --- the sweep's claim on the weight budget --------------------------------
+
+def test_the_sweep_reserves_budget_while_it_runs(tmp_path):
+    """Refusing to publish a starved sweep is damage control; this is the fix.
+
+    The poller must see the reservation *during* the sweep and see it gone
+    afterwards, or the next sweep starves exactly as the last three did.
+    """
+    from nat2.hl.ratelimit import SharedWeightBudget
+    from nat2.io.snapshot import SWEEP_RESERVE_FRACTION
+
+    path = tmp_path / "rl.sqlite"
+    budget = SharedWeightBudget(path, limit=1000, window_s=60, owner="sweep")
+    poller = SharedWeightBudget(path, limit=1000, window_s=60, owner="capture")
+    seen = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(poller.reserved_by_others())
+        return httpx.Response(200, json=STATE)
+
+    client = InfoClient(budget)
+    client._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    registry = Registry(tmp_path / "r.sqlite")
+    asyncio.run(sweep(registry, client, ["0xa", "0xb"]))
+
+    assert seen and all(r == int(1000 * SWEEP_RESERVE_FRACTION) for r in seen)
+    assert poller.reserved_by_others() == 0
+
+
+def test_a_starved_sweep_reports_why_it_failed(tmp_path):
+    """Starvation and outage both present as errors; the result separates them."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(429, headers={"retry-after": "0"}, json={})
+
+    client = _client(handler)
+    registry = Registry(tmp_path / "r.sqlite")
+    result = asyncio.run(sweep(registry, client, ["0xa"]))
+
+    assert "refused" in result
+    assert result["throttled"] > 0
+    assert "429" in result["why"]

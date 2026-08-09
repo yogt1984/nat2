@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 
 # --- verified-against-docs table -------------------------------------------
@@ -34,6 +35,10 @@ INFO_WEIGHT: dict[str, int] = {
     "userRole": 60,
 }
 # ---------------------------------------------------------------------------
+
+# A reservation never takes the whole account: a starved capture daemon drops
+# tape it can never recover, which is a worse loss than a slow sweep.
+MIN_SHARE_FRACTION = 0.15
 
 
 def weight_of(info_type: str) -> int:
@@ -95,6 +100,16 @@ class WeightBudget:
         with self._lock:
             return 1.0 - self._spent(time.monotonic()) / self.limit
 
+    @contextmanager
+    def reserve(self, weight: int, ttl_s: float = 120.0):
+        """Claim `weight` of the account for this process.
+
+        A no-op here: one process competing with itself needs no protocol. The
+        shared budget overrides this, and callers reserve unconditionally so
+        the in-memory budget stays usable in tests.
+        """
+        yield self
+
 
 class SharedWeightBudget(WeightBudget):
     """Weight budget shared across processes.
@@ -107,18 +122,41 @@ class SharedWeightBudget(WeightBudget):
 
     Uses the wall clock rather than a monotonic one because the record has to
     mean the same thing to a process that started later.
+
+    **Sharing is not the same as fairness.** First-come-first-served let the
+    capture daemon's 15s poll crowd out the registry sweep: on 2026-08-08 all
+    2,177 sweep requests failed against a budget the poller had already spent,
+    three times running. So a process may *reserve* part of the account with
+    `reserve()`, and every other process then admits against the remainder. The
+    lease is a heartbeat rather than a promise -- it expires on its own, so a
+    sweep that dies holding one cannot starve the daemon forever.
     """
 
-    def __init__(self, path, limit: int = IP_WEIGHT_PER_MINUTE, window_s: float = 60.0):
+    def __init__(
+        self,
+        path,
+        limit: int = IP_WEIGHT_PER_MINUTE,
+        window_s: float = 60.0,
+        owner: str | None = None,
+    ):
         super().__init__(limit=limit, window_s=window_s)
+        import os
         import sqlite3
         from pathlib import Path
 
+        # Identity is per process, so a lease taken by the cycle is foreign to
+        # the capture daemon without either being told the other's name.
+        self.owner = owner or f"pid{os.getpid()}"
+        self._lease: tuple[int, float] | None = None
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with sqlite3.connect(self.path) as conn:
             conn.execute("CREATE TABLE IF NOT EXISTS spend (ts REAL NOT NULL, weight INT)")
             conn.execute("CREATE INDEX IF NOT EXISTS spend_ts ON spend(ts)")
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS leases ("
+                " owner TEXT PRIMARY KEY, weight INT NOT NULL, expires REAL NOT NULL)"
+            )
 
     def _try(self, weight: int) -> float:
         import sqlite3
@@ -127,9 +165,23 @@ class SharedWeightBudget(WeightBudget):
         cutoff = now - self.window_s
         with sqlite3.connect(self.path, timeout=10.0, isolation_level="IMMEDIATE") as conn:
             conn.execute("DELETE FROM spend WHERE ts <= ?", (cutoff,))
+            conn.execute("DELETE FROM leases WHERE expires <= ?", (now,))
             spent = conn.execute("SELECT COALESCE(SUM(weight), 0) FROM spend").fetchone()[0]
-            if spent + weight <= self.limit:
+            reserved = conn.execute(
+                "SELECT COALESCE(SUM(weight), 0) FROM leases WHERE owner <> ?", (self.owner,)
+            ).fetchone()[0]
+            allowed = max(int(self.limit * MIN_SHARE_FRACTION), self.limit - reserved)
+            if spent + weight <= allowed:
                 conn.execute("INSERT INTO spend VALUES (?, ?)", (now, weight))
+                if self._lease is not None:
+                    # Progress renews the claim, so the lease outlives a slow
+                    # sweep but not a dead one.
+                    lease_weight, ttl_s = self._lease
+                    conn.execute(
+                        "INSERT INTO leases VALUES (?,?,?) ON CONFLICT(owner) DO UPDATE SET"
+                        " weight=excluded.weight, expires=excluded.expires",
+                        (self.owner, lease_weight, now + ttl_s),
+                    )
                 return 0.0
             oldest = conn.execute("SELECT MIN(ts) FROM spend").fetchone()[0] or now
         sleep_for = max(0.05, oldest + self.window_s - now)
@@ -137,3 +189,33 @@ class SharedWeightBudget(WeightBudget):
             self.waits += 1
             self.wait_s += sleep_for
         return sleep_for
+
+    @contextmanager
+    def reserve(self, weight: int, ttl_s: float = 120.0):
+        import sqlite3
+
+        weight = max(0, min(int(weight), int(self.limit * (1 - MIN_SHARE_FRACTION))))
+        expires = time.time() + ttl_s
+        with sqlite3.connect(self.path, timeout=10.0, isolation_level="IMMEDIATE") as conn:
+            conn.execute(
+                "INSERT INTO leases VALUES (?,?,?) ON CONFLICT(owner) DO UPDATE SET"
+                " weight=excluded.weight, expires=excluded.expires",
+                (self.owner, weight, expires),
+            )
+        self._lease = (weight, ttl_s)
+        try:
+            yield self
+        finally:
+            self._lease = None
+            with sqlite3.connect(self.path, timeout=10.0, isolation_level="IMMEDIATE") as conn:
+                conn.execute("DELETE FROM leases WHERE owner = ?", (self.owner,))
+
+    def reserved_by_others(self) -> int:
+        import sqlite3
+
+        with sqlite3.connect(self.path, timeout=10.0) as conn:
+            return conn.execute(
+                "SELECT COALESCE(SUM(weight), 0) FROM leases"
+                " WHERE owner <> ? AND expires > ?",
+                (self.owner, time.time()),
+            ).fetchone()[0]

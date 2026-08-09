@@ -30,6 +30,14 @@ CONCURRENCY = 24
 # Above this share of failed requests the sweep is a sample of the API's mood,
 # not of the venue's positions.
 MAX_ERROR_FRACTION = 0.5
+# The sweep is bursty and rare; the capture poller is steady and constant, so
+# first-come-first-served hands the account to the poller and starves the
+# sweep. Claiming most of the budget for the few minutes a sweep runs is what
+# stops that -- the remainder is still above the poller's steady draw.
+SWEEP_RESERVE_FRACTION = 0.6
+# Refreshed on every admitted request, so this bounds how long a *stalled*
+# sweep can hold the claim, not how long a slow one may run.
+LEASE_TTL_S = 120.0
 
 
 def parse_state(address: str, state: dict) -> list[Position]:
@@ -109,7 +117,11 @@ async def sweep(
         if on_progress and done % 250 == 0:
             on_progress(done, len(addresses))
 
-    await asyncio.gather(*(fetch(a) for a in addresses))
+    reserve = info.budget.reserve(
+        int(info.budget.limit * SWEEP_RESERVE_FRACTION), ttl_s=LEASE_TTL_S
+    )
+    with reserve:
+        await asyncio.gather(*(fetch(a) for a in addresses))
     errors = sum(failures.values())
     result = {
         "wallets": len(addresses),
@@ -118,6 +130,9 @@ async def sweep(
         "errors": errors,
         "why": top_reasons(failures),
         "elapsed_s": (now_ns() - started) / 1e9,
+        # Starvation and outage both present as errors; these separate them.
+        "throttled": info.throttled,
+        "waited_s": round(info.budget.wait_s, 1),
     }
 
     blocked = refusal(len(addresses), holders, errors)

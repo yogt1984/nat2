@@ -16,6 +16,7 @@ from nat2.hl.info import THROTTLED_BACKOFF_S, InfoClient
 from nat2.hl.ratelimit import (
     DEFAULT_INFO_WEIGHT,
     INFO_WEIGHT,
+    MIN_SHARE_FRACTION,
     SharedWeightBudget,
     WeightBudget,
     table_age_days,
@@ -66,6 +67,85 @@ def test_shared_budget_counts_its_own_waits(tmp_path):
     budget._try(10)
     budget._try(10)
     assert budget.waits == 1 and budget.wait_s > 0
+
+
+def test_without_a_reservation_one_process_can_take_the_whole_account(tmp_path):
+    # The starvation that failed 2,177 sweep requests three times running.
+    poller = SharedWeightBudget(tmp_path / "rl.sqlite", limit=100, window_s=60, owner="capture")
+    assert poller._try(100) == 0.0
+    assert poller.reserved_by_others() == 0
+
+
+def test_a_reservation_holds_budget_back_from_other_processes(tmp_path):
+    path = tmp_path / "rl.sqlite"
+    sweeper = SharedWeightBudget(path, limit=100, window_s=60, owner="sweep")
+    poller = SharedWeightBudget(path, limit=100, window_s=60, owner="capture")
+
+    with sweeper.reserve(60):
+        assert poller.reserved_by_others() == 60
+        # 60 reserved leaves 40: the poller is admitted under that and blocked
+        # over it.
+        assert poller._try(40) == 0.0
+        assert poller._try(10) > 0
+
+
+def test_the_holder_still_draws_on_the_full_limit(tmp_path):
+    path = tmp_path / "rl.sqlite"
+    sweeper = SharedWeightBudget(path, limit=100, window_s=60, owner="sweep")
+    with sweeper.reserve(60):
+        # Its own lease must not be subtracted from its own allowance, or the
+        # reservation would throttle the very sweep it exists to protect.
+        assert sweeper._try(90) == 0.0
+
+
+def test_a_reservation_never_starves_the_other_process_completely(tmp_path):
+    path = tmp_path / "rl.sqlite"
+    greedy = SharedWeightBudget(path, limit=100, window_s=60, owner="sweep")
+    poller = SharedWeightBudget(path, limit=100, window_s=60, owner="capture")
+    with greedy.reserve(100_000):
+        # Dropped tape cannot be recovered later, so the poller keeps a floor
+        # no reservation can take.
+        assert poller._try(int(100 * MIN_SHARE_FRACTION)) == 0.0
+
+
+def test_a_reservation_is_released_even_when_the_sweep_raises(tmp_path):
+    path = tmp_path / "rl.sqlite"
+    sweeper = SharedWeightBudget(path, limit=100, window_s=60, owner="sweep")
+    poller = SharedWeightBudget(path, limit=100, window_s=60, owner="capture")
+    with pytest.raises(RuntimeError):
+        with sweeper.reserve(60):
+            raise RuntimeError("sweep died")
+    assert poller.reserved_by_others() == 0
+
+
+def test_a_stalled_reservation_expires_on_its_own(tmp_path):
+    path = tmp_path / "rl.sqlite"
+    sweeper = SharedWeightBudget(path, limit=100, window_s=60, owner="sweep")
+    poller = SharedWeightBudget(path, limit=100, window_s=60, owner="capture")
+    with sweeper.reserve(60, ttl_s=0.2):
+        assert poller.reserved_by_others() == 60
+        time.sleep(0.25)
+        # A process killed mid-sweep leaves the row behind; it must not hold
+        # the account hostage.
+        assert poller.reserved_by_others() == 0
+
+
+def test_progress_renews_the_lease_so_a_slow_sweep_keeps_its_share(tmp_path):
+    path = tmp_path / "rl.sqlite"
+    sweeper = SharedWeightBudget(path, limit=100, window_s=60, owner="sweep")
+    poller = SharedWeightBudget(path, limit=100, window_s=60, owner="capture")
+    with sweeper.reserve(60, ttl_s=0.3):
+        time.sleep(0.2)
+        assert sweeper._try(1) == 0.0  # a request renews it
+        time.sleep(0.2)
+        assert poller.reserved_by_others() == 60
+
+
+def test_in_memory_budget_still_supports_reserve(tmp_path):
+    # Callers reserve unconditionally, so the no-op must exist on the base.
+    budget = WeightBudget(limit=100)
+    with budget.reserve(50):
+        assert budget._try(100) == 0.0
 
 
 def _client(handler, monkeypatch, budget) -> InfoClient:

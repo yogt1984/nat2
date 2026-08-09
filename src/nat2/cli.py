@@ -523,6 +523,50 @@ def wallets_replay(
     console.print(f"positions by source: {reg.source_counts()}")
 
 
+@app.command("bars")
+def bars_show(
+    coin: str,
+    interval: Annotated[str, typer.Option(help="bar width, e.g. 1m, 5m, 1h")] = "1m",
+    limit: Annotated[int, typer.Option(help="most recent bars to show")] = 12,
+    root: RootOpt = RAW,
+) -> None:
+    """Bars from the captured tape, with how late each one became usable."""
+    from nat2.features.bars import bars, iter_prints
+    from nat2.features.context import by_coin, features, iter_contexts
+    from nat2.io.worm import read_records
+
+    interval_ns = parse_window(interval)
+    prints = iter_prints(read_records(root, "hl.trades"))
+    built = bars(prints, interval_ns, coin=coin.upper())
+    if not built:
+        console.print(f"[red]no captured prints for {coin.upper()}[/red]")
+        raise typer.Exit(1)
+
+    table = Table(title=f"{coin.upper()} {interval} bars ({len(built)} captured)")
+    for col in ("close", "open", "high", "low", "volume", "prints", "usable after close"):
+        table.add_column(col, justify="right")
+    for bar in built[-limit:]:
+        # Negative would mean a bar usable before it finished forming; the
+        # builder forbids it, so this column is a check as well as a report.
+        lag = (bar.available_at - bar.t_close) / NS
+        table.add_row(
+            to_dt(bar.t_close).strftime("%H:%M:%S"), f"{bar.open:g}", f"{bar.high:g}",
+            f"{bar.low:g}", f"{bar.volume:,.3f}", str(bar.prints), f"{lag:+.1f}s",
+        )
+    console.print(table)
+
+    rows = features(by_coin(iter_contexts(read_records(root, "hl.assetctxs"))).get(coin.upper(), []))
+    if rows:
+        last = rows[-1]
+        z = last["premium_z"]
+        console.print(
+            f"premium {last['premium'] * 1e4:+.2f}bp"
+            f" (z {'n/a' if z is None else f'{z:+.2f}'}) · "
+            f"funding {last['funding'] * 1e4:+.3f}bp/hr · "
+            f"OI ${last['oi_notional'] / 1e6:,.0f}M · mark {last['mark']:g}"
+        )
+
+
 @app.command("cycle")
 def cycle(
     snapshot_every: Annotated[str, typer.Option(help="registry sweep interval")] = "6h",

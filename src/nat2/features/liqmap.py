@@ -83,6 +83,32 @@ class LiqMap:
         }
 
 
+def nearest(liqmap: "LiqMap", min_notional: float = 0.0) -> dict:
+    """Closest bucket above and below the mark carrying real mass.
+
+    `d_near` in the feature list is a distance to a *cluster*, not to the
+    nearest stray position, so a threshold is part of the definition rather
+    than a tuning knob applied afterwards.
+    """
+    up_price = up_notional = down_price = down_notional = None
+    for bucket in liqmap.buckets:
+        if bucket.notional <= min_notional:
+            continue
+        mid = (bucket.low + bucket.high) / 2
+        if mid >= liqmap.mark and up_price is None:
+            up_price, up_notional = mid, bucket.notional
+        elif mid < liqmap.mark:
+            down_price, down_notional = mid, bucket.notional
+    return {
+        "up_px": up_price,
+        "up_notional": up_notional,
+        "up_dist": (up_price / liqmap.mark - 1) if up_price else None,
+        "down_px": down_price,
+        "down_notional": down_notional,
+        "down_dist": (down_price / liqmap.mark - 1) if down_price else None,
+    }
+
+
 def build(
     positions: list[Position],
     coin: str,

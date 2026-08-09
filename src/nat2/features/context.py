@@ -122,6 +122,14 @@ def as_of(contexts: list[Context], t: int) -> Context | None:
     return latest
 
 
+def latest(contexts: list[Context]) -> dict[str, Context]:
+    """Most recent observation per coin. Arrival-ordered, so last wins."""
+    out: dict[str, Context] = {}
+    for ctx in contexts:
+        out[ctx.coin] = ctx
+    return out
+
+
 def features(contexts: list[Context], window: int = 30) -> list[dict]:
     """Per-observation context features for one coin, in arrival order."""
     premiums = [c.premium for c in contexts]

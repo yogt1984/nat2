@@ -128,6 +128,14 @@ Open items, each needing a test that fails loudly if the answer moves:
   and `gate map` should treat a sudden coverage collapse as a distinct failure
   from genuine low coverage.
 
+- **An unattributed write landed in the append-only store.** A one-coin
+  `nat2.liqmap` snapshot appeared at 12:53:54 on 2026-08-09, 39s before the
+  first deliberate one, and nothing that ran at that moment accounts for it —
+  the cycle daemon has no `mapsnap` job row, and the tests write only to tmp
+  directories. The record itself is valid, so nothing is corrupted, but a write
+  into a WORM store that cannot be attributed is exactly the class of thing
+  this design refuses to shrug at. Find the writer before trusting the series.
+
 - `hl.l2book` cadence is sparser than the 1s hint implies (45 records / 70s
   across 3 coins). Measure properly before `book_thin` depends on it.
 - Clock skew flipped sign between capture runs (−196ms then +395ms). Within the

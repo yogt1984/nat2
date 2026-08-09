@@ -66,6 +66,12 @@ STREAMS: dict[str, StreamSpec] = {
     "hl.assetctxs": StreamSpec(
         "hl.assetctxs", "", "metaAndAssetCtxs", False, _no_clock, False, 10.0
     ),
+    # Derived, not captured: a map we computed. It lives in the same
+    # append-only store because a historical feature needs the map as it was
+    # believed at the time, and the registry keeps only the present.
+    "nat2.liqmap": StreamSpec(
+        "nat2.liqmap", "", "", False, _no_clock, False, 300.0
+    ),
 }
 
 CHANNEL_TO_STREAM = {s.channel: name for name, s in STREAMS.items() if s.channel}

@@ -43,6 +43,11 @@ class LiqMap:
     buckets: list[Bucket]
     up: dict[float, float] = field(default_factory=dict)      # band -> notional above
     down: dict[float, float] = field(default_factory=dict)    # band -> notional below
+    # Cross-margin only. A cross position's liquidation price moves whenever
+    # any other position in that account moves, so cross mass is the
+    # cascade-prone subset and deserves its own imbalance.
+    up_cross: dict[float, float] = field(default_factory=dict)
+    down_cross: dict[float, float] = field(default_factory=dict)
     total_notional: float = 0.0
     cross_notional: float = 0.0
     published_notional: float = 0.0
@@ -65,6 +70,11 @@ class LiqMap:
     def imbalance(self, band: float) -> float:
         """(below - above) / (below + above): the magnet imbalance."""
         up, down = self.up.get(band, 0.0), self.down.get(band, 0.0)
+        total = up + down
+        return (down - up) / total if total else 0.0
+
+    def imbalance_cross(self, band: float) -> float:
+        up, down = self.up_cross.get(band, 0.0), self.down_cross.get(band, 0.0)
         total = up + down
         return (down - up) / total if total else 0.0
 
@@ -134,6 +144,8 @@ def build(
     liqmap = LiqMap(coin=coin, mark=mark, buckets=buckets, oi_notional=oi_notional)
     liqmap.up = {b: 0.0 for b in bands}
     liqmap.down = {b: 0.0 for b in bands}
+    liqmap.up_cross = {b: 0.0 for b in bands}
+    liqmap.down_cross = {b: 0.0 for b in bands}
 
     for position in positions:
         if position.coin != coin or position.size == 0:
@@ -168,9 +180,14 @@ def build(
             # invites the reader to mistake it for the whole picture.
             liqmap.outside_span += 1
         distance = (price - mark) / mark
+        is_cross = position.margin_type == "cross"
         for band in bands:
             if 0 < distance <= band:
                 liqmap.up[band] += notional
+                if is_cross:
+                    liqmap.up_cross[band] += notional
             elif -band <= distance < 0:
                 liqmap.down[band] += notional
+                if is_cross:
+                    liqmap.down_cross[band] += notional
     return liqmap

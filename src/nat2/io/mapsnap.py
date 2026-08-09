@@ -54,6 +54,7 @@ def summarise(liqmap, min_notional: float = CLUSTER_MIN_NOTIONAL) -> dict:
         "up": {str(b): liqmap.up.get(b, 0.0) for b in DEFAULT_BANDS},
         "down": {str(b): liqmap.down.get(b, 0.0) for b in DEFAULT_BANDS},
         "imb": {str(b): liqmap.imbalance(b) for b in DEFAULT_BANDS},
+        "imb_cross": {str(b): liqmap.imbalance_cross(b) for b in DEFAULT_BANDS},
         "near": near,
     }
 

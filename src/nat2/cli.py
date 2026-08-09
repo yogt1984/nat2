@@ -567,6 +567,65 @@ def bars_show(
         )
 
 
+@app.command("features")
+def features_build(
+    coin: str,
+    interval: Annotated[str, typer.Option(help="bar width, e.g. 1m, 5m")] = "1m",
+    out: Annotated[Path, typer.Option("--out", help="write Parquet here")] = None,
+    limit: Annotated[int, typer.Option(help="rows to display")] = 8,
+    root: RootOpt = RAW,
+    registry: RegistryOpt = REGISTRY,
+) -> None:
+    """Build the L0 feature frame for one coin, joined as-of each bar."""
+    from nat2.core.registry import Registry
+    from nat2.features.bars import bars, iter_prints
+    from nat2.features.context import by_coin, iter_contexts
+    from nat2.features.frame import build as build_frame
+    from nat2.io.mapsnap import STREAM, series
+    from nat2.io.worm import read_records
+
+    name = coin.upper()
+    built = bars(iter_prints(read_records(root, "hl.trades")), parse_window(interval), coin=name)
+    if not built:
+        console.print(f"[red]no captured prints for {name}[/red]")
+        raise typer.Exit(1)
+
+    contexts = by_coin(iter_contexts(read_records(root, "hl.assetctxs"))).get(name, [])
+    maps = series(read_records(root, STREAM), name)
+    events = [e for e in Registry(registry).liquidations() if e.coin == name]
+    rows, stats = build_frame(built, contexts, maps, liquidations=events, coin=name)
+
+    table = Table(title=f"{name} L0 frame — {stats.rows} rows, {interval} bars")
+    for col in ("close", "ret", "sigma", "premium_z", "imb_002", "d_near_dn", "map_age_s", "tau"):
+        table.add_column(col, justify="right")
+    for row in rows[-limit:]:
+        table.add_row(
+            to_dt(row["t_close"]).strftime("%H:%M"),
+            f"{row['ret'] * 1e4:+.1f}bp",
+            _cell(row["sigma"], "{:.5f}"), _cell(row["premium_z"], "{:+.2f}"),
+            _cell(row["imb_002"], "{:+.2f}"), _cell(row["d_near_dn"], "{:+.1f}"),
+            _cell(row["map_age_s"], "{:.0f}s"), _cell(row["tau"], "{:.0f}"),
+        )
+    console.print(table)
+    console.print(
+        f"populated: map {stats.map_frac:.0%}, context {stats.context_frac:.0%}"
+        + ("  [yellow](map history only starts when snapshots began)[/yellow]"
+           if stats.map_frac < 1 else "")
+    )
+
+    if out:
+        import polars as pl
+
+        out.parent.mkdir(parents=True, exist_ok=True)
+        pl.DataFrame(rows, infer_schema_length=None).write_parquet(out)
+        console.print(f"wrote {stats.rows} rows -> {out}")
+
+
+def _cell(value, fmt: str) -> str:
+    """Missing renders as a dash, never as zero."""
+    return "-" if value is None else fmt.format(value)
+
+
 @app.command("cycle")
 def cycle(
     snapshot_every: Annotated[str, typer.Option(help="registry sweep interval")] = "6h",

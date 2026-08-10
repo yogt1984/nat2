@@ -334,6 +334,22 @@ class ClusterScore:
         ordered = sorted(self.distances)
         return ordered[len(ordered) // 2]
 
+    @property
+    def stderr(self) -> float:
+        """Standard error of the side hit rate under the coin-flip null."""
+        return (0.25 / self.scored) ** 0.5 if self.scored else 0.0
+
+    @property
+    def z(self) -> float:
+        """Standard errors from a coin flip, signed.
+
+        Reported because a rate without its precision invites the same mistake
+        as a rate without its baseline: 42.8% over 208 events is about two
+        standard errors from chance, which is suggestive and not decisive, and
+        the number alone does not say so.
+        """
+        return (self.side_hit_rate - 0.5) / self.stderr if self.stderr else 0.0
+
     def summary(self) -> dict:
         return {
             "events": self.events,
@@ -341,6 +357,8 @@ class ClusterScore:
             "side_hit_rate": self.side_hit_rate,
             "band_hit_rate": self.band_hit_rate,
             "side_baseline": 0.5,
+            "stderr": self.stderr,
+            "z": self.z,
             "no_map": self.no_map,
             "pre_map": self.pre_map,
             "stale_map": self.stale_map,

@@ -99,7 +99,8 @@ def run(
     scored = score_clusters(registry.liquidations(), map_series or {})
     detail_text = (
         f"side {scored.side_hit_rate:.1%} vs coin flip 50% "
-        f"(need {min_side_hit_rate:.0%}), band {scored.band_hit_rate:.1%}, "
+        f"(need {min_side_hit_rate:.0%}, z {scored.z:+.1f}), "
+        f"band {scored.band_hit_rate:.1%}, "
         f"median distance {scored.median_distance:.2%}, over {scored.scored} scored; "
         f"set aside: {scored.no_map} no map, {scored.pre_map} predate it, "
         f"{scored.stale_map} stale, {scored.outside_span} beyond the bands"

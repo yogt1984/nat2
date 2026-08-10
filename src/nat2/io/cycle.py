@@ -44,7 +44,10 @@ class CycleConfig:
     snapshot_interval_ns: int
     scan_interval_ns: int
     replay_interval_ns: int = 5 * 60 * NS
-    mapsnap_interval_ns: int = 5 * 60 * NS
+    # Free: reads the registry and captured contexts, spends no API weight.
+    # At five minutes, 253 of 461 candidate liquidations were set aside as
+    # stale -- more than half the sample discarded for no saving.
+    mapsnap_interval_ns: int = 60 * NS
     raw_root: Path = Path("data/raw")
     observers: int = 40
     wallet_limit: int = 0

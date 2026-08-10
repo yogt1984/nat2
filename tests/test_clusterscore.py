@@ -149,3 +149,18 @@ def test_rates_are_zero_rather_than_undefined_when_nothing_scored():
     result = score_clusters([], {}, BANDS)
     assert result.side_hit_rate == 0.0 and result.band_hit_rate == 0.0
     assert result.median_distance == 0.0
+
+
+def test_the_summary_reports_precision_not_just_a_rate():
+    # A rate without its precision invites the same mistake as a rate without
+    # its baseline. 42.8% over 208 events is ~2 standard errors from chance.
+    snap = _snap(t_ingest=1, mark=100.0, up={0.005: 10.0}, down={0.005: 1e6})
+    events = [_event(t_event=50 + i, mark_px=99.7, tid=i) for i in range(100)]
+    summary = score_clusters(events, {"BTC": [snap]}, BANDS).summary()
+    assert summary["stderr"] == 0.05
+    assert summary["z"] == 10.0
+
+
+def test_precision_is_zero_rather_than_undefined_on_an_empty_score():
+    result = score_clusters([], {}, BANDS)
+    assert result.stderr == 0.0 and result.z == 0.0

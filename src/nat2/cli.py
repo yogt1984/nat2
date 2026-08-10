@@ -844,6 +844,8 @@ def gate_map(
     from nat2.core.registry import Registry
     from nat2.features.liqmap import build
     from nat2.gates import map as gate
+    from nat2.io.mapsnap import STREAM, iter_snapshots
+    from nat2.io.worm import read_records
 
     async def _run() -> None:
         marks, oi = await _marks_and_oi()
@@ -853,7 +855,12 @@ def gate_map(
             for c in (x.strip() for x in coins.split(","))
             if c in marks
         ]
-        verdict, checks = gate.run(reg, maps, Ledger(ledger), min_coverage=min_coverage)
+        history: dict[str, list[dict]] = {}
+        for row in iter_snapshots(read_records(RAW, STREAM)):
+            history.setdefault(row["coin"], []).append(row)
+        verdict, checks = gate.run(
+            reg, maps, Ledger(ledger), min_coverage=min_coverage, map_series=history
+        )
         table = Table(title="gate map")
         for col in ("", "coin", "check", "detail"):
             table.add_column(col, overflow="fold")

@@ -156,6 +156,25 @@ Related and confirmed working: at a 6h horizon the purge removes every training
 row and the evaluation reports **0 folds** rather than producing a result from
 what is left. Ten hours of tape cannot support a six-hour label.
 
+**The map does not call the side.** *(2026-08-10, first answerable run)*
+`gate map` predictive, scored against the snapshot that predated each event:
+**side hit rate 42.8% over 208 liquidations, against a 50% coin flip.** Median
+distance from the mark 0.31%. Set aside: 127 with no map for that coin, 86
+predating the first snapshot, 253 with a map staler than five minutes.
+
+Below chance, not merely unimpressive. On this sample the claim "forced flow
+arrives on the side where the map put the mass" is not supported.
+
+*A correction that matters more than the number.* An earlier version of this
+check scored whether a liquidation landed within 1% of the nearest mapped
+cluster price, and reported **82.1% against a 20% chance rate, lift 4.11x** —
+which passed the gate. That measurement was close to tautological: clusters are
+built from wallets' liquidation prices, so liquidations occur near them almost
+by construction, and the "chance" model of a uniform price over ±10% was not
+the right null. The side-based test with a coin-flip baseline replaced it and
+reverses the verdict. The flattering number was mine; the sceptical replacement
+was already in the repo.
+
 ## Unexplained
 
 - **An unattributed write into the append-only store.** *(2026-08-09 12:53:54)*

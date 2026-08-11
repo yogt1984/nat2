@@ -84,25 +84,117 @@ class Comparison:
     costs: dict
     skipped_folds: int = 0
     leaked: int = 0
+    min_delta_z: float = 2.0
+
+    @property
+    def delta(self) -> float:
+        """Baseline log loss minus expert log loss. Positive means better."""
+        if not len(self.expert) or not len(self.baseline):
+            return 0.0
+        return self.baseline.log_loss() - self.expert.log_loss()
+
+    @property
+    def delta_z(self) -> float:
+        """Standard errors of the paired per-row improvement.
+
+        Rows are paired -- same fold, same test row, same label -- so the
+        difference in per-row loss is a paired sample and its standard error is
+        the right yardstick. Without it, "beats baseline" fires on any margin
+        at all: the first honest run had 0.6877 against 0.6918, which is a
+        0.6% relative improvement on a metric already sitting at ln 2, and
+        calling that a win would be rewarding noise.
+
+        **Weighted, using the effective sample size.** An unweighted version
+        reported z +3.28 while the weighted delta was *negative* -- it was
+        counting overlapping cascade rows as independent evidence, which is
+        precisely the inflation uniqueness weights exist to correct. The two
+        must agree in sign or one of them is lying.
+        """
+        pairs = _paired_losses(self.expert, self.baseline)
+        weights = self.expert.w if len(self.expert.w) == len(pairs) else [1.0] * len(pairs)
+        total = sum(weights)
+        if len(pairs) < 2 or total <= 0:
+            return 0.0
+        mean = sum(d * w for d, w in zip(pairs, weights)) / total
+        variance = sum(w * (d - mean) ** 2 for d, w in zip(pairs, weights)) / total
+        # Kish: overlapping labels shrink how much independent evidence there is.
+        n_eff = total ** 2 / sum(w * w for w in weights)
+        if n_eff <= 1:
+            return 0.0
+        stderr = (variance / n_eff) ** 0.5
+        if stderr == 0:
+            # Every row improved by exactly the same amount. Zero variance is
+            # maximal consistency, not zero evidence -- returning 0 here would
+            # reject the most decisive case there is.
+            return 0.0 if mean == 0 else math.copysign(float("inf"), mean)
+        return mean / stderr
+
+    @property
+    def constant_log_loss(self) -> float:
+        """Loss of predicting the observed base rate for every row.
+
+        The floor any model has to clear before beating anything else means
+        much. A model can be less bad than its baseline while both are worse
+        than a constant -- which is exactly what the first honest Stage A run
+        showed: 0.6996 against 0.7017, with the constant at 0.688.
+        """
+        rate = self.expert.base_rate
+        if not len(self.expert) or not 0.0 < rate < 1.0:
+            return float("nan")
+        return -(rate * math.log(rate) + (1 - rate) * math.log(1 - rate))
+
+    @property
+    def beats_constant(self) -> bool:
+        loss = self.expert.log_loss()
+        floor = self.constant_log_loss
+        return loss == loss and floor == floor and loss < floor
 
     @property
     def beats_baseline(self) -> bool:
-        """Lower log loss out of sample. Ties do not count as beating."""
+        """Better than the baseline by more than noise, and better than a constant.
+
+        A strict inequality is not a verdict, and neither is winning a race
+        between two models that both lose to predicting the base rate.
+        """
         if not len(self.expert) or not len(self.baseline):
             return False
-        return self.expert.log_loss() < self.baseline.log_loss()
+        return (
+            self.delta > 0
+            and self.delta_z >= self.min_delta_z
+            and self.beats_constant
+        )
 
     def verdict(self) -> dict:
         return {
             "expert": self.expert.summary(self.threshold),
             "baseline": self.baseline.summary(self.threshold),
             "beats_baseline": self.beats_baseline,
+            "delta": self.delta,
+            "delta_z": self.delta_z,
+            "constant_log_loss": self.constant_log_loss,
+            "beats_constant": self.beats_constant,
+            "min_delta_z": self.min_delta_z,
             "threshold": self.threshold,
             "folds": self.folds,
             "costs": self.costs,
             "skipped_folds": self.skipped_folds,
             "leaked": self.leaked,
         }
+
+
+def _row_losses(scored: "Scored") -> list[float]:
+    out = []
+    for label, prob in zip(scored.y, scored.p):
+        q = min(max(prob, 1e-9), 1 - 1e-9)
+        out.append(-(math.log(q) if label else math.log(1 - q)))
+    return out
+
+
+def _paired_losses(expert: "Scored", baseline: "Scored") -> list[float]:
+    """Per-row improvement, baseline minus expert, on identical rows."""
+    if len(expert) != len(baseline):
+        return []
+    return [b - e for e, b in zip(_row_losses(expert), _row_losses(baseline))]
 
 
 def _weighted_mean(values: list[float], weights: list[float]) -> float:

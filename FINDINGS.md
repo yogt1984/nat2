@@ -143,8 +143,18 @@ so a two-hour window offers roughly 14bp of travel against a 70bp target. That
 is a five-sigma move, so virtually every outcome is a **timeout**, which the
 binary label records as 0 — indistinguishable from "the opposite barrier won".
 
-The race only measures anything when the target distance is commensurate with
-what the horizon can traverse. Three ways to fix it, none yet chosen:
+**Fixed 2026-08-11.** Timeouts are excluded rather than recorded as misses --
+the race never finished, so it is not a negative answer -- and targets are
+gated on reachability (`max_reach_sigma`), so a cluster the horizon cannot
+traverse is never raced. Positive rate went from **0.7% to 51.8%**; the race
+now runs. Of 2,885 BTC rows at a 2h horizon: 1,603 out of reach, 168 timeout,
+762 labelled.
+
+**And the fixed label finds nothing.** magnet_a log loss 0.7099 against a
+baseline of 0.7017 and a constant-predictor floor of 0.6885 -- worse than both.
+It does not beat its baseline and does not clear the floor.
+
+The three options as originally written:
 
 - Pick the horizon per row from the distance, so `sqrt(h)·sigma ≈ distance`.
 - Restrict targets to clusters within a few sigma of what the horizon allows.

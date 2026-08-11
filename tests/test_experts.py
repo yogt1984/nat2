@@ -173,26 +173,68 @@ def _path(*points):
 def test_rows_whose_race_cannot_resolve_are_dropped():
     # No prices in the window: unlabelled, and dropped rather than defaulted to
     # the majority class.
-    data = build_dataset([_row()], _path(), horizon_ns=MIN, features=["imb_002"])
-    assert len(data) == 0
+    data, stats = build_dataset([_row()], _path(), horizon_ns=MIN, features=["imb_002"])
+    assert len(data) == 0 and stats.unresolved == 1
+
+
+def test_a_timeout_is_excluded_rather_than_called_a_miss():
+    # The race never finished. Counting it as 0 is what collapsed the first
+    # live run to a 0.7% positive rate.
+    rows = [_row(d_near_up_pct=0.01, d_near_dn_pct=None)]
+    data, stats = build_dataset(rows, _path((2 * MIN, 100.05)), 10 * MIN, ["imb_002"])
+    assert stats.timeouts == 1 and len(data) == 0
+
+
+def test_timeouts_can_be_included_deliberately():
+    rows = [_row(d_near_up_pct=0.01, d_near_dn_pct=None)]
+    data, stats = build_dataset(rows, _path((2 * MIN, 100.05)), 10 * MIN, ["imb_002"],
+                                include_timeouts=True)
+    assert stats.timeouts == 1 and data.y == [0]
+
+
+def test_an_unreachable_target_is_not_raced():
+    # A cluster five sigma away is decided by the clock, not the magnet.
+    rows = [_row(d_near_up_pct=0.05, d_near_dn_pct=None, sigma=0.0001)]
+    _data, stats = build_dataset(rows, _path((2 * MIN, 101.0)), 10 * MIN, ["imb_002"],
+                                 bar_ns=MIN, max_reach_sigma=1.0)
+    assert stats.unreachable == 1
+
+
+def test_a_reachable_target_is_raced():
+    rows = [_row(d_near_up_pct=0.001, d_near_dn_pct=None, sigma=0.01)]
+    _data, stats = build_dataset(rows, _path((2 * MIN, 100.2)), 10 * MIN, ["imb_002"],
+                                 bar_ns=MIN, max_reach_sigma=1.0)
+    assert stats.unreachable == 0 and stats.labelled == 1
+
+
+def test_reach_gating_is_off_unless_asked_for():
+    rows = [_row(d_near_up_pct=0.05, d_near_dn_pct=None, sigma=0.0001)]
+    _data, stats = build_dataset(rows, _path((2 * MIN, 101.0)), 10 * MIN, ["imb_002"])
+    assert stats.unreachable == 0
+
+
+def test_label_stats_report_the_positive_rate():
+    rows = [_row(d_near_up_pct=0.01, d_near_dn_pct=None)]
+    _data, stats = build_dataset(rows, _path((2 * MIN, 101.5)), 10 * MIN, ["imb_002"])
+    assert stats.summary()["positive_rate"] == 1.0
 
 
 def test_rows_without_a_map_are_dropped_not_imputed():
     rows = [_row(imb_002=None, d_near_up_pct=None, d_near_dn_pct=None)]
-    data = build_dataset(rows, _path((2 * MIN, 101.0)), MIN, ["imb_002"])
+    data, _stats = build_dataset(rows, _path((2 * MIN, 101.0)), MIN, ["imb_002"])
     assert len(data) == 0
 
 
 def test_a_reached_target_is_labelled_one():
     rows = [_row(d_near_up_pct=0.01, d_near_dn_pct=None)]
-    data = build_dataset(rows, _path((MIN + 1, 101.5)), 10 * MIN, ["imb_002"])
+    data, _stats = build_dataset(rows, _path((MIN + 1, 101.5)), 10 * MIN, ["imb_002"])
     assert data.y == [1]
     assert len(data.X) == 1 and len(data.weight) == 1
 
 
 def test_the_opposite_barrier_is_labelled_zero():
     rows = [_row(d_near_up_pct=0.01, d_near_dn_pct=None)]
-    data = build_dataset(rows, _path((MIN + 1, 98.0)), 10 * MIN, ["imb_002"])
+    data, _stats = build_dataset(rows, _path((MIN + 1, 98.0)), 10 * MIN, ["imb_002"])
     assert data.y == [0]
 
 
@@ -201,7 +243,7 @@ def test_dataset_arrays_stay_aligned():
         _row(t_decision=MIN, d_near_up_pct=0.01, d_near_dn_pct=None),
         _row(t_decision=2 * MIN, d_near_up_pct=0.01, d_near_dn_pct=None),
     ]
-    data = build_dataset(rows, _path((3 * MIN, 101.5)), 10 * MIN, ["imb_002", "close"])
+    data, _stats = build_dataset(rows, _path((3 * MIN, 101.5)), 10 * MIN, ["imb_002", "close"])
     assert len(data.X) == len(data.y) == len(data.weight) == len(data.rows)
     assert all(len(r) == 2 for r in data.X)
 
@@ -212,7 +254,7 @@ def test_overlapping_labels_are_down_weighted():
         _row(t_decision=MIN, d_near_up_pct=0.01, d_near_dn_pct=None),
         _row(t_decision=MIN, d_near_up_pct=0.01, d_near_dn_pct=None),
     ]
-    data = build_dataset(rows, _path((3 * MIN, 101.5)), 10 * MIN, ["imb_002"])
+    data, _stats = build_dataset(rows, _path((3 * MIN, 101.5)), 10 * MIN, ["imb_002"])
     assert len(data) == 2
     assert all(w < 1.0 for w in data.weight)
 

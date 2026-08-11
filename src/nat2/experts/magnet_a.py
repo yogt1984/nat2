@@ -74,33 +74,103 @@ def oriented_imbalance(row: dict) -> float | None:
     return imb * (-1 if target.side == 1 else 1)
 
 
+@dataclass
+class LabelStats:
+    """Why rows did not become training examples.
+
+    Reported rather than summed away, because the first live run produced a
+    0.7% positive rate and the reason was invisible: almost every outcome was a
+    timeout, and the binary label recorded those as 0 — indistinguishable from
+    the opposite barrier winning.
+    """
+
+    rows: int = 0
+    no_target: int = 0
+    unreachable: int = 0     # horizon cannot plausibly traverse the distance
+    unresolved: int = 0      # no prices in the window
+    timeouts: int = 0        # neither barrier hit; a question, not an answer
+    labelled: int = 0
+    positives: int = 0
+
+    @property
+    def positive_rate(self) -> float:
+        return self.positives / self.labelled if self.labelled else 0.0
+
+    def summary(self) -> dict:
+        return {
+            "rows": self.rows, "no_target": self.no_target,
+            "unreachable": self.unreachable, "unresolved": self.unresolved,
+            "timeouts": self.timeouts, "labelled": self.labelled,
+            "positive_rate": self.positive_rate,
+        }
+
+
+def reachable(row: dict, distance: float, horizon_ns: int, bar_ns: int,
+              max_sigma: float | None) -> bool:
+    """Could the horizon plausibly traverse the distance at all?
+
+    A cluster 70bp away against 1.3bp of one-minute vol is a five-sigma move
+    over two hours: the race is decided by the clock, not by the magnet, and
+    every such row is a timeout wearing a label. Gating on reach is what makes
+    the question answerable rather than making the answer prettier.
+    """
+    if max_sigma is None:
+        return True
+    sigma = row.get("sigma")
+    if not sigma or bar_ns <= 0:
+        return False
+    bars = max(1.0, horizon_ns / bar_ns)
+    return abs(distance) <= max_sigma * sigma * (bars ** 0.5)
+
+
 def build_dataset(
     rows: list[dict],
     paths: dict[str, list[tuple[int, float]]],
     horizon_ns: int,
     features: list[str],
-) -> Dataset:
-    """Label each row by racing its own target, and drop what cannot be labelled."""
-    from nat2.labels.barriers import sample_weights
+    bar_ns: int = 0,
+    max_reach_sigma: float | None = None,
+    include_timeouts: bool = False,
+) -> tuple[Dataset, LabelStats]:
+    """Label each row by racing its own target, and say what was dropped.
 
+    A timeout is excluded by default. It is not a negative answer — the race
+    never finished — and counting it as one is what collapsed the first live
+    run to a 0.7% positive rate. Excluding it makes the label an honest
+    conditional: *given that one of the two barriers was reached, which came
+    first*. That is what "race" means, and it is stated rather than implied.
+    """
+    from nat2.labels.barriers import TIMEOUT, sample_weights
+
+    stats = LabelStats(rows=len(rows))
     usable = finite_rows(rows, ["close", "imb_002"])
-    kept, labels, t0s = [], [], []
-    results = []
+    kept, labels, t0s, results = [], [], [], []
     for row in usable:
         target = target_of(row)
         if target is None:
+            stats.no_target += 1
+            continue
+        if not reachable(row, target.distance, horizon_ns, bar_ns, max_reach_sigma):
+            stats.unreachable += 1
             continue
         path = paths.get(row["coin"], [])
         result = race(path, row["t_decision"], row["close"], target.price, horizon_ns)
         if not result.resolved:
             # No data in the window, or a degenerate target. Unlabelled rows
             # are dropped rather than defaulted to the majority class.
+            stats.unresolved += 1
             continue
+        if result.outcome == TIMEOUT:
+            stats.timeouts += 1
+            if not include_timeouts:
+                continue
         kept.append(row)
         results.append(result)
         labels.append(result.label)
         t0s.append(row["t_decision"])
 
+    stats.labelled = len(labels)
+    stats.positives = sum(1 for v in labels if v)
     weights = sample_weights(results, t0s)
     return Dataset(
         columns=list(features),
@@ -108,7 +178,7 @@ def build_dataset(
         y=labels,
         weight=weights,
         rows=kept,
-    )
+    ), stats
 
 
 class MagnetA(Expert):
@@ -188,6 +258,6 @@ def default_model():
 
 
 __all__ = [
-    "ColumnExpert", "ImbalanceBaseline", "MagnetA", "Target",
-    "build_dataset", "oriented_imbalance", "target_of",
+    "ColumnExpert", "ImbalanceBaseline", "LabelStats", "MagnetA", "Target",
+    "build_dataset", "oriented_imbalance", "reachable", "target_of",
 ]

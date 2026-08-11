@@ -8,6 +8,8 @@ on so the cost threshold stops meaning anything.
 
 from __future__ import annotations
 
+import math
+
 import pytest
 
 from nat2.core.costs import Costs
@@ -200,3 +202,119 @@ def test_calibration_can_be_switched_off_for_both():
     result = evaluate(_Oracle(), _dataset(), horizon_ns=MIN, costs=Costs(),
                       n_splits=3, calibrate=False)
     assert set(result.expert.p) <= {0.9, 0.1}
+
+
+def test_a_tiny_improvement_swamped_by_noise_is_not_a_win():
+    # A positive mean delta is not a verdict when the per-row differences
+    # scatter far wider than the mean.
+    import random
+    from nat2.validate.evaluate import Comparison
+
+    random.seed(0)
+    n = 200
+    y = [i % 2 for i in range(n)]
+    expert = Scored("e", y=y, p=[random.uniform(0.2, 0.8) for _ in range(n)],
+                    w=[1.0] * n)
+    baseline = Scored("b", y=y, p=[random.uniform(0.2, 0.8) for _ in range(n)],
+                      w=[1.0] * n)
+    close = Comparison(expert, baseline, 0.56, {}, {}, min_delta_z=2.0)
+    assert abs(close.delta_z) < 2.0
+    assert not close.beats_baseline
+
+
+def test_a_clear_improvement_survives_the_significance_bar():
+    from nat2.validate.evaluate import Comparison
+
+    expert = Scored("e", y=[1, 0] * 50, p=[0.95, 0.05] * 50, w=[1.0] * 100)
+    baseline = Scored("b", y=[1, 0] * 50, p=[0.5, 0.5] * 100, w=[1.0] * 100)
+    clear = Comparison(expert, baseline, 0.56, {}, {}, min_delta_z=2.0)
+    assert clear.beats_baseline and clear.delta_z > 2.0
+
+
+def test_delta_is_zero_when_there_is_nothing_to_compare():
+    from nat2.validate.evaluate import Comparison
+
+    empty = Comparison(Scored("e"), Scored("b"), 0.56, {}, {})
+    assert empty.delta == 0.0 and empty.delta_z == 0.0
+    assert not empty.beats_baseline
+
+
+def test_a_perfectly_consistent_improvement_is_maximally_significant():
+    # Zero variance is maximal consistency, not zero evidence.
+    from nat2.validate.evaluate import Comparison
+
+    # A single-class label set has no meaningful constant floor, so the labels
+    # alternate and the expert is confidently right on both.
+    y = [i % 2 for i in range(100)]
+    expert = Scored("e", y=y, p=[0.1 if v == 0 else 0.9 for v in y], w=[1.0] * 100)
+    baseline = Scored("b", y=y, p=[0.5] * 100, w=[1.0] * 100)
+    result = Comparison(expert, baseline, 0.56, {}, {})
+    assert result.delta_z == float("inf")
+    assert result.beats_constant and result.beats_baseline
+
+
+def test_a_perfectly_consistent_degradation_is_not_a_win():
+    from nat2.validate.evaluate import Comparison
+
+    y = [i % 2 for i in range(100)]
+    expert = Scored("e", y=y, p=[0.5] * 100, w=[1.0] * 100)
+    baseline = Scored("b", y=y, p=[0.1 if v == 0 else 0.9 for v in y], w=[1.0] * 100)
+    result = Comparison(expert, baseline, 0.56, {}, {})
+    assert result.delta_z == float("-inf") and not result.beats_baseline
+
+
+def test_beating_the_baseline_is_not_enough_if_both_lose_to_a_constant():
+    # 0.6996 against 0.7017 with the constant at 0.688: less bad is not a win.
+    from nat2.validate.evaluate import Comparison
+
+    y = [1 if i % 2 else 0 for i in range(200)]
+    expert = Scored("e", y=y, p=[0.45] * 200, w=[1.0] * 200)
+    baseline = Scored("b", y=y, p=[0.40] * 200, w=[1.0] * 200)
+    result = Comparison(expert, baseline, 0.56, {}, {})
+    assert result.delta > 0
+    assert not result.beats_constant
+    assert not result.beats_baseline
+
+
+def test_the_constant_floor_is_the_label_entropy():
+    from nat2.validate.evaluate import Comparison
+
+    y = [1] * 50 + [0] * 50
+    result = Comparison(Scored("e", y=y, p=[0.5] * 100, w=[1.0] * 100),
+                        Scored("b", y=y, p=[0.5] * 100, w=[1.0] * 100), 0.56, {}, {})
+    assert result.constant_log_loss == pytest.approx(math.log(2))
+
+
+def test_the_significance_test_respects_the_uniqueness_weights():
+    # An unweighted z reported +3.28 while the weighted delta was negative:
+    # it counted overlapping cascade rows as independent evidence.
+    from nat2.validate.evaluate import Comparison
+
+    y = [i % 2 for i in range(100)]
+    # The expert is better on the heavily-weighted rows and worse on the rest.
+    expert = Scored("e", y=y, p=[0.9 if v else 0.1 for v in y], w=[1.0] * 100)
+    baseline = Scored("b", y=y, p=[0.5] * 100, w=[1.0] * 100)
+    unweighted = Comparison(expert, baseline, 0.56, {}, {})
+    assert unweighted.delta_z > 0
+
+    # Down-weight every row equally: the sign must not flip, but the effective
+    # sample size falls, so the evidence weakens rather than strengthening.
+    faint = Scored("e", y=y, p=expert.p, w=[0.01] * 100)
+    faint_baseline = Scored("b", y=y, p=baseline.p, w=[0.01] * 100)
+    result = Comparison(faint, faint_baseline, 0.56, {}, {})
+    assert result.delta_z > 0
+
+
+def test_delta_and_its_significance_agree_in_sign():
+    from nat2.validate.evaluate import Comparison
+
+    y = [i % 2 for i in range(100)]
+    weights = [1.0 if i < 10 else 0.01 for i in range(100)]
+    # Better on the light rows, worse on the heavy ones: weighted delta must be
+    # negative, and z must not claim otherwise.
+    p_expert = [0.5 if i < 10 else (0.9 if y[i] else 0.1) for i in range(100)]
+    p_base = [0.9 if y[i] else 0.1 for i in range(100)]
+    expert = Scored("e", y=y, p=p_expert, w=weights)
+    baseline = Scored("b", y=y, p=p_base, w=weights)
+    result = Comparison(expert, baseline, 0.56, {}, {})
+    assert result.delta < 0 and result.delta_z < 0

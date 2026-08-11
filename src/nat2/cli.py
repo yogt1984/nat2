@@ -633,6 +633,9 @@ def eval_expert(
     interval: Annotated[str, typer.Option(help="bar width")] = "1m",
     splits: Annotated[int, typer.Option(help="walk-forward folds")] = 5,
     min_rows: Annotated[int, typer.Option(help="minimum labelled rows to fit")] = 200,
+    reach: Annotated[float, typer.Option(help="max target distance, in sigma over the horizon")] = 1.0,
+    include_timeouts: Annotated[bool, typer.Option("--include-timeouts",
+        help="count an unfinished race as a miss")] = False,
     root: RootOpt = RAW,
     registry: RegistryOpt = REGISTRY,
 ) -> None:
@@ -661,10 +664,19 @@ def eval_expert(
     rows, stats = build_frame(built, contexts, maps, liquidations=events, coin=name)
 
     expert = MagnetA(horizon_ns=horizon_ns, min_rows=min_rows)
-    data = build_dataset(rows, {name: path(prints, name)}, horizon_ns, expert.features)
+    data, labels = build_dataset(
+        rows, {name: path(prints, name)}, horizon_ns, expert.features,
+        bar_ns=parse_window(interval), max_reach_sigma=reach,
+        include_timeouts=include_timeouts,
+    )
     console.print(
         f"frame {stats.rows} rows (map {stats.map_frac:.0%}) -> "
         f"{len(data)} labelled, positive rate {data.positive_rate:.1%}"
+    )
+    console.print(
+        f"[dim]dropped: {labels.no_target} no target, {labels.unreachable} out of "
+        f"reach, {labels.unresolved} unresolved, {labels.timeouts} timeout"
+        + ("" if include_timeouts else " (excluded)") + "[/dim]"
     )
     if not len(data):
         console.print(
@@ -696,6 +708,13 @@ def eval_expert(
     console.print(
         f"costs {verdict['costs']['round_trip_bps']:.1f}bp round trip "
         f"(hash {verdict['costs']['hash']}) · threshold {verdict['threshold']:.3f}"
+    )
+    console.print(
+        f"log-loss delta {verdict['delta']:+.4f} (z {verdict['delta_z']:+.2f}, "
+        f"need {verdict['min_delta_z']:+.1f}) · constant floor "
+        f"{verdict['constant_log_loss']:.4f} "
+        + ("[green]cleared[/green]" if verdict["beats_constant"]
+           else "[red]NOT cleared[/red]")
     )
     if result.beats_baseline:
         console.print("[bold green]beats its baseline[/bold green] out of sample")

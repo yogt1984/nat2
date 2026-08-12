@@ -10,6 +10,9 @@ controls and the decision rule now, so that the result cannot be chosen after se
 It is the concrete form of `gate magnet`, and it is `nat2`'s first falsifiable claim about the
 market rather than about the data.
 
+The estimator, and the cross-cell constraint that makes it identifiable, are in
+[`CONSISTENCY.md`](CONSISTENCY.md).
+
 Status: pre-registered, not started. **Nothing accrues until capture runs.**
 
 ---

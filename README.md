@@ -77,3 +77,5 @@ settles it.
   decision rule fixed before the data. The concrete form of `gate magnet`.
 - [`CONSISTENCY.md`](CONSISTENCY.md) — how the drift field is estimated, and the cross-cell
   constraint that supplies the power the sample size does not.
+- [`ATTACK.md`](ATTACK.md) — the function itself: why a cluster is worth pushing into, and why
+  its exponents are forced by the impact law rather than fitted.

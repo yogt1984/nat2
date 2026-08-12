@@ -73,3 +73,5 @@ settles it.
 - [`docs/DESIGN.md`](docs/DESIGN.md) — the full design: capture, features, experts, meta,
   allocation, execution, milestones, and the risks worth naming.
 - [`TASKS.md`](TASKS.md) — what is next, what it unblocks, and what is still unverified.
+- [`HYPOTHESIS_1.md`](HYPOTHESIS_1.md) — the magnet claim, pre-registered: null, controls and
+  decision rule fixed before the data. The concrete form of `gate magnet`.

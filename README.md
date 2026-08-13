@@ -35,7 +35,7 @@ uv run nat2 capture hl --all        # WORM ingest, dual-timestamped — start th
 uv run nat2 gate feed               # is the data intact and causal?
 uv run nat2 wallets seed            # leaderboard-seeded registry (equity + volume)
 uv run nat2 cycle                   # snapshot, then observe liquidations
-uv run nat2 map show BTC            # liquidation map, with coverage
+uv run nat2 map BTC --rank          # liquidation map, coverage, and which cluster ranks
 uv run nat2 gate map                # and whether it earns the right to be built on
 uv run nat2 log verify              # the ledger is tamper-evident; check it
 ```
@@ -69,6 +69,10 @@ M0 done (`gate feed` PASS). M1 built; `gate map` FAILs on `predictive` — a gat
 be evaluated must not pass. The open question is whether the wallets we map and the wallets that
 actually get liquidated are the same population; `nat2 cycle` is accumulating the series that
 settles it.
+
+**Capture has been running continuously since 2026-08-13** under
+[`packaging/systemd`](packaging/systemd/) — 18 coins, recycled every 6h around an unexplained
+long-run degradation. That is day 1, and every date in `HYPOTHESIS_1.md` §8 is measured from it.
 
 - [`ASKING.md`](ASKING.md) — how to read the liquidation map: what to ask, which flags are not
   cosmetic, and the five ways to get a plausible wrong answer.

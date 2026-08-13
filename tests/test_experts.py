@@ -29,9 +29,8 @@ from nat2.experts.base import (
 from nat2.experts.magnet_a import (
     ImbalanceBaseline,
     MagnetA,
+    barrier_pct,
     build_dataset,
-    oriented_imbalance,
-    target_of,
 )
 
 MIN = 60_000_000_000
@@ -72,7 +71,7 @@ def test_an_expert_without_a_baseline_cannot_be_instantiated():
 def test_lookback_is_the_deepest_feature_the_expert_reads():
     expert = MagnetA(horizon_ns=MIN)
     assert expert.lookback() >= 30
-    assert expert.describe()["baseline"] == "imb_toward_target"
+    assert expert.describe()["baseline"] == "neg_imbalance"
 
 
 # --- matrix construction ---------------------------------------------------
@@ -94,52 +93,57 @@ def test_finite_rows_drops_rather_than_imputes():
     assert len(finite_rows(rows, ["close", "imb_002"])) == 1
 
 
-# --- target selection ------------------------------------------------------
+# --- barrier placement: independent of the map ------------------------------
 
-def test_the_nearer_cluster_is_the_target():
-    assert target_of(_row(d_near_up_pct=0.01, d_near_dn_pct=-0.02)).side == 1
-    assert target_of(_row(d_near_up_pct=0.03, d_near_dn_pct=-0.005)).side == -1
-
-
-def test_a_tie_resolves_downward_and_stays_reproducible():
-    target = target_of(_row(d_near_up_pct=0.01, d_near_dn_pct=-0.01))
-    assert target.side == -1
-    assert target_of(_row(d_near_up_pct=0.01, d_near_dn_pct=-0.01)).side == -1
+def test_the_barrier_is_sized_from_volatility_alone():
+    # A barrier placed at a cluster makes its location a function of the
+    # covariate, distance-to-cluster leaks into the null, and 0.5 stops being
+    # the null. HYPOTHESIS_1.md §3 forbids it.
+    row = _row(sigma=0.01)
+    width = barrier_pct(row, horizon_ns=100 * MIN, bar_ns=MIN, k=1.0)
+    assert width == pytest.approx(0.01 * 10.0)
 
 
-def test_a_cluster_beyond_the_mapped_bands_is_not_a_target():
-    # The map's bands stop at 5%; beyond that the features do not describe it.
-    assert target_of(_row(d_near_up_pct=0.9, d_near_dn_pct=None)) is None
+def test_the_barrier_ignores_the_map_entirely():
+    near = _row(sigma=0.01, d_near_up_pct=0.001, d_near_dn_pct=-0.5, imb_002=0.9)
+    far = _row(sigma=0.01, d_near_up_pct=0.04, d_near_dn_pct=-0.002, imb_002=-0.9)
+    horizon = dict(horizon_ns=100 * MIN, bar_ns=MIN, k=1.0)
+    assert barrier_pct(near, **horizon) == barrier_pct(far, **horizon)
 
 
-def test_no_cluster_means_no_target():
-    assert target_of(_row(d_near_up_pct=None, d_near_dn_pct=None)) is None
+def test_the_barrier_scales_with_k_and_with_the_root_of_the_horizon():
+    row = _row(sigma=0.01)
+    one = barrier_pct(row, 100 * MIN, MIN, 1.0)
+    assert barrier_pct(row, 100 * MIN, MIN, 2.0) == pytest.approx(2 * one)
+    assert barrier_pct(row, 400 * MIN, MIN, 1.0) == pytest.approx(2 * one)
 
 
-def test_target_price_is_on_the_right_side_of_the_mark():
-    up = target_of(_row(d_near_up_pct=0.01, d_near_dn_pct=None))
-    down = target_of(_row(d_near_up_pct=None, d_near_dn_pct=-0.01))
-    assert up.price > 100.0 > down.price
+@pytest.mark.parametrize("kw", [
+    {"sigma": None}, {"sigma": 0.0}, {"sigma": -0.01},
+])
+def test_no_volatility_means_no_barrier(kw):
+    assert barrier_pct(_row(**kw), 100 * MIN, MIN, 1.0) is None
 
 
-def test_a_row_without_a_price_has_no_target():
-    assert target_of(_row(close=0.0)) is None
+@pytest.mark.parametrize("bad", [{"bar_ns": 0}, {"horizon_ns": 0}, {"k": 0.0}])
+def test_degenerate_barrier_inputs_yield_none(bad):
+    args = {"horizon_ns": 100 * MIN, "bar_ns": MIN, "k": 1.0, **bad}
+    assert barrier_pct(_row(sigma=0.01), **args) is None
 
 
 # --- the baseline ----------------------------------------------------------
 
-def test_imbalance_is_oriented_toward_the_target():
-    # imb is (below - above), so positive points down. A downside target with
-    # positive imb means the magnet favours it.
-    down_target = _row(d_near_up_pct=0.03, d_near_dn_pct=-0.01, imb_002=0.8)
-    up_target = _row(d_near_up_pct=0.01, d_near_dn_pct=-0.03, imb_002=0.8)
-    assert oriented_imbalance(down_target) == pytest.approx(0.8)
-    assert oriented_imbalance(up_target) == pytest.approx(-0.8)
+def test_the_baseline_negates_the_imbalance():
+    # Mass above the mark is shorts; shorts liquidate by buying; forced buying
+    # pushes price up. imbalance() is (below - above), so mass above makes it
+    # negative and the probability of the UPPER barrier must rise.
+    mass_above = ImbalanceBaseline().predict([_row(imb_002=-0.8)])[0]
+    mass_below = ImbalanceBaseline().predict([_row(imb_002=0.8)])[0]
+    assert mass_above > 0.5 > mass_below
 
 
 def test_the_baseline_abstains_rather_than_guessing():
-    scores = ImbalanceBaseline().predict([_row(imb_002=None)])
-    assert scores == [0.5]
+    assert ImbalanceBaseline().predict([_row(imb_002=None)]) == [0.5]
 
 
 def test_the_baseline_is_its_own_baseline():
@@ -148,10 +152,7 @@ def test_the_baseline_is_its_own_baseline():
 
 
 def test_baseline_scores_stay_inside_the_unit_interval():
-    scores = ImbalanceBaseline().predict([
-        _row(imb_002=5.0, d_near_dn_pct=-0.01, d_near_up_pct=0.03),
-        _row(imb_002=-5.0, d_near_dn_pct=-0.01, d_near_up_pct=0.03),
-    ])
+    scores = ImbalanceBaseline().predict([_row(imb_002=5.0), _row(imb_002=-5.0)])
     assert all(0.0 <= s <= 1.0 for s in scores)
 
 
@@ -170,93 +171,72 @@ def _path(*points):
     return {"BTC": list(points)}
 
 
-def test_rows_whose_race_cannot_resolve_are_dropped():
-    # No prices in the window: unlabelled, and dropped rather than defaulted to
-    # the majority class.
-    data, stats = build_dataset([_row()], _path(), horizon_ns=MIN, features=["imb_002"])
-    assert len(data) == 0 and stats.unresolved == 1
+def _labelled(*points, **kw):
+    args = {"horizon_ns": 100 * MIN, "bar_ns": MIN, "k": 1.0, "features": ["imb_002"]}
+    args.update(kw)
+    rows = args.pop("rows", [_row(sigma=0.01)])
+    return build_dataset(rows, _path(*points), args.pop("horizon_ns"),
+                         args.pop("features"), **args)
+
+
+def test_touching_the_upper_barrier_first_is_a_one():
+    data, stats = _labelled((2 * MIN, 110.5))
+    assert data.y == [1] and stats.labelled == 1
+
+
+def test_touching_the_lower_barrier_first_is_a_zero():
+    data, _stats = _labelled((2 * MIN, 89.5))
+    assert data.y == [0]
+
+
+def test_order_decides_which_barrier_won():
+    data, _stats = _labelled((2 * MIN, 89.5), (3 * MIN, 111.0))
+    assert data.y == [0], "the lower barrier was reached first"
 
 
 def test_a_timeout_is_excluded_rather_than_called_a_miss():
-    # The race never finished. Counting it as 0 is what collapsed the first
-    # live run to a 0.7% positive rate.
-    rows = [_row(d_near_up_pct=0.01, d_near_dn_pct=None)]
-    data, stats = build_dataset(rows, _path((2 * MIN, 100.05)), 10 * MIN, ["imb_002"])
+    data, stats = _labelled((2 * MIN, 100.1))
     assert stats.timeouts == 1 and len(data) == 0
 
 
 def test_timeouts_can_be_included_deliberately():
-    rows = [_row(d_near_up_pct=0.01, d_near_dn_pct=None)]
-    data, stats = build_dataset(rows, _path((2 * MIN, 100.05)), 10 * MIN, ["imb_002"],
-                                include_timeouts=True)
+    data, stats = _labelled((2 * MIN, 100.1), include_timeouts=True)
     assert stats.timeouts == 1 and data.y == [0]
 
 
-def test_an_unreachable_target_is_not_raced():
-    # A cluster five sigma away is decided by the clock, not the magnet.
-    rows = [_row(d_near_up_pct=0.05, d_near_dn_pct=None, sigma=0.0001)]
-    _data, stats = build_dataset(rows, _path((2 * MIN, 101.0)), 10 * MIN, ["imb_002"],
-                                 bar_ns=MIN, max_reach_sigma=1.0)
-    assert stats.unreachable == 1
+def test_a_row_without_volatility_cannot_be_labelled():
+    _data, stats = _labelled((2 * MIN, 110.5), rows=[_row(sigma=None)])
+    assert stats.no_sigma == 1 and stats.labelled == 0
 
 
-def test_a_reachable_target_is_raced():
-    rows = [_row(d_near_up_pct=0.001, d_near_dn_pct=None, sigma=0.01)]
-    _data, stats = build_dataset(rows, _path((2 * MIN, 100.2)), 10 * MIN, ["imb_002"],
-                                 bar_ns=MIN, max_reach_sigma=1.0)
-    assert stats.unreachable == 0 and stats.labelled == 1
+def test_rows_whose_race_cannot_resolve_are_dropped():
+    data, stats = _labelled()
+    assert len(data) == 0 and stats.unresolved == 1
 
 
-def test_reach_gating_is_off_unless_asked_for():
-    rows = [_row(d_near_up_pct=0.05, d_near_dn_pct=None, sigma=0.0001)]
-    _data, stats = build_dataset(rows, _path((2 * MIN, 101.0)), 10 * MIN, ["imb_002"])
-    assert stats.unreachable == 0
-
-
-def test_label_stats_report_the_positive_rate():
-    rows = [_row(d_near_up_pct=0.01, d_near_dn_pct=None)]
-    _data, stats = build_dataset(rows, _path((2 * MIN, 101.5)), 10 * MIN, ["imb_002"])
-    assert stats.summary()["positive_rate"] == 1.0
-
-
-def test_rows_without_a_map_are_dropped_not_imputed():
-    rows = [_row(imb_002=None, d_near_up_pct=None, d_near_dn_pct=None)]
-    data, _stats = build_dataset(rows, _path((2 * MIN, 101.0)), MIN, ["imb_002"])
-    assert len(data) == 0
-
-
-def test_a_reached_target_is_labelled_one():
-    rows = [_row(d_near_up_pct=0.01, d_near_dn_pct=None)]
-    data, _stats = build_dataset(rows, _path((MIN + 1, 101.5)), 10 * MIN, ["imb_002"])
-    assert data.y == [1]
-    assert len(data.X) == 1 and len(data.weight) == 1
-
-
-def test_the_opposite_barrier_is_labelled_zero():
-    rows = [_row(d_near_up_pct=0.01, d_near_dn_pct=None)]
-    data, _stats = build_dataset(rows, _path((MIN + 1, 98.0)), 10 * MIN, ["imb_002"])
-    assert data.y == [0]
+def test_a_wider_barrier_is_harder_to_reach():
+    tight, _ = _labelled((2 * MIN, 110.5), k=1.0)
+    wide, wide_stats = _labelled((2 * MIN, 110.5), k=3.0)
+    assert tight.y == [1]
+    assert len(wide) == 0 and wide_stats.timeouts == 1
 
 
 def test_dataset_arrays_stay_aligned():
-    rows = [
-        _row(t_decision=MIN, d_near_up_pct=0.01, d_near_dn_pct=None),
-        _row(t_decision=2 * MIN, d_near_up_pct=0.01, d_near_dn_pct=None),
-    ]
-    data, _stats = build_dataset(rows, _path((3 * MIN, 101.5)), 10 * MIN, ["imb_002", "close"])
+    rows = [_row(sigma=0.01, t_decision=MIN), _row(sigma=0.01, t_decision=2 * MIN)]
+    data, _stats = _labelled((5 * MIN, 110.5), rows=rows, features=["imb_002", "close"])
     assert len(data.X) == len(data.y) == len(data.weight) == len(data.rows)
     assert all(len(r) == 2 for r in data.X)
 
 
 def test_overlapping_labels_are_down_weighted():
-    # Two rows resolved by the same price move are not two observations.
-    rows = [
-        _row(t_decision=MIN, d_near_up_pct=0.01, d_near_dn_pct=None),
-        _row(t_decision=MIN, d_near_up_pct=0.01, d_near_dn_pct=None),
-    ]
-    data, _stats = build_dataset(rows, _path((3 * MIN, 101.5)), 10 * MIN, ["imb_002"])
-    assert len(data) == 2
-    assert all(w < 1.0 for w in data.weight)
+    rows = [_row(sigma=0.01, t_decision=MIN), _row(sigma=0.01, t_decision=MIN)]
+    data, _stats = _labelled((5 * MIN, 110.5), rows=rows)
+    assert len(data) == 2 and all(w < 1.0 for w in data.weight)
+
+
+def test_label_stats_report_the_positive_rate():
+    _data, stats = _labelled((2 * MIN, 110.5))
+    assert stats.summary()["positive_rate"] == 1.0
 
 
 # --- fitting refuses rather than pretending --------------------------------

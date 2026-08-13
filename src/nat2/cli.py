@@ -633,7 +633,7 @@ def eval_expert(
     interval: Annotated[str, typer.Option(help="bar width")] = "1m",
     splits: Annotated[int, typer.Option(help="walk-forward folds")] = 5,
     min_rows: Annotated[int, typer.Option(help="minimum labelled rows to fit")] = 200,
-    reach: Annotated[float, typer.Option(help="max target distance, in sigma over the horizon")] = 1.0,
+    k: Annotated[float, typer.Option("--k", help="barrier half-width, in sigma over the horizon")] = 1.0,
     include_timeouts: Annotated[bool, typer.Option("--include-timeouts",
         help="count an unfinished race as a miss")] = False,
     root: RootOpt = RAW,
@@ -666,16 +666,15 @@ def eval_expert(
     expert = MagnetA(horizon_ns=horizon_ns, min_rows=min_rows)
     data, labels = build_dataset(
         rows, {name: path(prints, name)}, horizon_ns, expert.features,
-        bar_ns=parse_window(interval), max_reach_sigma=reach,
-        include_timeouts=include_timeouts,
+        bar_ns=parse_window(interval), k=k, include_timeouts=include_timeouts,
     )
     console.print(
         f"frame {stats.rows} rows (map {stats.map_frac:.0%}) -> "
         f"{len(data)} labelled, positive rate {data.positive_rate:.1%}"
     )
     console.print(
-        f"[dim]dropped: {labels.no_target} no target, {labels.unreachable} out of "
-        f"reach, {labels.unresolved} unresolved, {labels.timeouts} timeout"
+        f"[dim]dropped: {labels.no_sigma} no sigma, "
+        f"{labels.unresolved} unresolved, {labels.timeouts} timeout"
         + ("" if include_timeouts else " (excluded)") + "[/dim]"
     )
     if not len(data):
@@ -688,7 +687,7 @@ def eval_expert(
     result = evaluate(expert, data, horizon_ns, Costs(), n_splits=splits)
     verdict = result.verdict()
 
-    table = Table(title=f"{name} eval — {horizon} horizon, {splits} folds")
+    table = Table(title=f"{name} eval — {horizon} horizon, k={k:g}σ, {splits} folds")
     for col in ("", "n", "base rate", "log loss", "brier", "decisions", "hit rate"):
         table.add_column(col, justify="right")
     for side in ("expert", "baseline"):
@@ -783,7 +782,8 @@ def cycle(
 def map_show(
     coin: str,
     registry: RegistryOpt = REGISTRY,
-    buckets: Annotated[int, typer.Option(help="rows to display each side")] = 16,
+    buckets: Annotated[int, typer.Option(help="max rows to display each side")] = 12,
+    min_share: Annotated[float, typer.Option(help="hide buckets under this %% of mapped notional")] = 1.0,
     resolution: Annotated[float, typer.Option(help="bucket width, percent")] = 0.125,
     span: Annotated[float, typer.Option(help="how far from mark to look, percent")] = 10.0,
 ) -> None:
@@ -805,7 +805,18 @@ def map_show(
             console.print(f"[red]no registry positions in {coin}[/red] -- snapshot first")
             raise typer.Exit(1)
 
-        rows = [b for b in liqmap.buckets if b.notional > 0]
+        # Filter by mass, not by adjacency. Showing the nearest buckets fills
+        # the screen with noise and pushes the clusters that actually carry the
+        # notional off the bottom -- on BTC the two largest were nearly cut
+        # while 81 near-empty buckets were being considered for display.
+        # Relative to what is actually ON the map, not to total mapped
+        # notional: most positions sit beyond the span and are in no bucket at
+        # all, so a floor taken from the total emptied the table entirely for
+        # every coin except BTC.
+        in_span = sum(b.notional for b in liqmap.buckets)
+        floor = in_span * min_share / 100.0
+        rows = [b for b in liqmap.buckets if b.notional > floor]
+        hidden_mass = sum(b.notional for b in liqmap.buckets if 0 < b.notional <= floor)
         above = [b for b in rows if b.low >= liqmap.mark][:buckets]
         below = [b for b in rows if b.high < liqmap.mark][-buckets:]
         peak = max((b.notional for b in above + below), default=1.0)
@@ -824,7 +835,7 @@ def map_show(
         console.print(table)
 
         bands = ", ".join(f"{b:.1%} imb {liqmap.imbalance(b):+.2f}" for b in sorted(liqmap.up))
-        shown = sum(1 for b in above) + sum(1 for b in below)
+        shown = len(above) + len(below)
         console.print(
             f"coverage [bold]{liqmap.coverage:.1%}[/bold] of venue position notional "
             f"(OI x{OI_SIDES:g}) · {liqmap.positions} positions "
@@ -834,8 +845,14 @@ def map_show(
         hidden = len(rows) - shown
         if hidden > 0:
             console.print(
-                f"[yellow]{hidden} more bucket(s) not shown[/yellow] -- raise --buckets; "
-                "the bars are scaled to the largest bucket displayed, not the largest one"
+                f"[yellow]{hidden} cluster(s) over the floor not shown[/yellow] -- "
+                "raise --buckets; bars scale to the largest bucket displayed"
+            )
+        if hidden_mass > 0:
+            console.print(
+                f"[dim]below the {min_share:g}% floor: ${hidden_mass / 1e6:,.1f}M "
+                f"({hidden_mass / liqmap.total_notional:.0%} of mapped notional), "
+                "spread thin[/dim]"
             )
         console.print(f"{bands}")
 

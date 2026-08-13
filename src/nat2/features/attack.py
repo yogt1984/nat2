@@ -65,7 +65,10 @@ class Reach:
 
     psi: float                    # the supremum
     psi_jackknife: float          # recomputed without the winning cluster's largest member
-    distance: float | None        # d*, relative; None when there is no mass
+    # d*, relative and **signed by side**: negative is below the mark. An
+    # unsigned magnitude reads as a real number pointing the wrong way, which
+    # is the failure mode this system exists to refuse.
+    distance: float | None = None
     mass: float = 0.0             # effective mass within d*
     positions: int = 0            # how many contributed to it
 
@@ -172,7 +175,7 @@ def attack_ratio(
     return Reach(
         psi=best,
         psi_jackknife=jackknife,
-        distance=best_distance,
+        distance=None if best_distance is None else side * best_distance,
         mass=best_mass,
         positions=best_count,
     )

@@ -636,6 +636,8 @@ def eval_expert(
     k: Annotated[float, typer.Option("--k", help="barrier half-width, in sigma over the horizon")] = 1.0,
     include_timeouts: Annotated[bool, typer.Option("--include-timeouts",
         help="count an unfinished race as a miss")] = False,
+    placebo: Annotated[int, typer.Option(help="permutation replications; 0 to skip")] = 0,
+    seed: Annotated[int, typer.Option(help="placebo seed")] = 0,
     root: RootOpt = RAW,
     registry: RegistryOpt = REGISTRY,
 ) -> None:
@@ -664,8 +666,9 @@ def eval_expert(
     rows, stats = build_frame(built, contexts, maps, liquidations=events, coin=name)
 
     expert = MagnetA(horizon_ns=horizon_ns, min_rows=min_rows)
+    _PATHS[name] = path(prints, name)
     data, labels = build_dataset(
-        rows, {name: path(prints, name)}, horizon_ns, expert.features,
+        rows, {name: _PATHS[name]}, horizon_ns, expert.features,
         bar_ns=parse_window(interval), k=k, include_timeouts=include_timeouts,
     )
     console.print(
@@ -715,6 +718,13 @@ def eval_expert(
         + ("[green]cleared[/green]" if verdict["beats_constant"]
            else "[red]NOT cleared[/red]")
     )
+    if placebo:
+        _run_placebo(
+            placebo, seed, rows, built, contexts, maps, events, name,
+            expert, horizon_ns, parse_window(interval), k, include_timeouts,
+            splits, result.delta_z,
+        )
+
     if result.beats_baseline:
         console.print("[bold green]beats its baseline[/bold green] out of sample")
     else:
@@ -723,6 +733,56 @@ def eval_expert(
             "the machinery is not earning its keep, so it does not enter the pool"
         )
     raise typer.Exit(0 if result.beats_baseline else 1)
+
+
+def _run_placebo(replications, seed, rows, built, contexts, maps, events, coin,
+                 expert, horizon_ns, bar_ns, k, include_timeouts, splits, real_z):
+    """Re-run the pipeline with map masses shuffled across their own locations.
+
+    Labels are invariant -- barriers are placed from volatility alone -- so only
+    the features are rebuilt. Anything that survives was geometry, which is the
+    confound `HYPOTHESIS_1.md` §5 exists to remove.
+    """
+    from nat2.core.costs import Costs
+    from nat2.experts.magnet_a import MagnetA, build_dataset
+    from nat2.features.bars import path
+    from nat2.features.frame import build as build_frame
+    from nat2.validate.evaluate import evaluate
+    from nat2.validate.placebo import PlaceboResult, permute_series
+
+    zs = []
+    console.print(f"[dim]placebo: {replications} replication(s) …[/dim]")
+    for i in range(replications):
+        shuffled = permute_series({coin: maps}, seed + i)[coin]
+        fake_rows, _ = build_frame(built, contexts, shuffled, liquidations=events, coin=coin)
+        fake_data, _ = build_dataset(
+            fake_rows, {coin: _PATHS[coin]}, horizon_ns, expert.features,
+            bar_ns=bar_ns, k=k, include_timeouts=include_timeouts,
+        )
+        if not len(fake_data):
+            continue
+        fake = evaluate(MagnetA(horizon_ns=horizon_ns, min_rows=expert.min_rows),
+                        fake_data, horizon_ns, Costs(), n_splits=splits)
+        zs.append(fake.delta_z)
+
+    outcome = PlaceboResult(real_z=real_z, placebo_z=zs)
+    summary = outcome.summary()
+    console.print(
+        f"placebo z: mean {summary['mean_placebo_z']:+.2f}, max "
+        f"{summary['max_placebo_z']:+.2f} over {summary['replications']} run(s) · "
+        f"{summary['exceeded']} matched or beat the real {real_z:+.2f} · "
+        f"p {summary['p_value']:.3f}"
+    )
+    if outcome.collapses():
+        console.print("[green]effect collapses under permutation[/green] — mass, not geometry")
+    else:
+        console.print(
+            "[bold red]effect survives permutation[/bold red] — indistinguishable "
+            "from geometry, which is the null, not the hypothesis"
+        )
+
+
+_PATHS: dict = {}
 
 
 @app.command("cycle")

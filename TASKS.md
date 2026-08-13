@@ -130,6 +130,27 @@ Open items, each needing a test that fails loudly if the answer moves:
   the connection cap is not, and it bounds any future per-user work.
 - **Node data** format, retention, access cost — sizes M3.
 
+## Opened by the 2026-08-13 census
+
+- **Liquidation side is not persisted.** `LiquidationEvent` carries `mark_px`,
+  `method` and notional but not which way the liquidated position was facing,
+  so the reversion study proxies direction from the pre-event return. The side
+  is available on the counterparty's fill and is being discarded at parse time.
+  Until it is stored, every signed study rests on a proxy.
+
+- **Is excluding builder-deployed perps right?** `DESIGN.md` excludes them by
+  default, and the census says that is where the cascades are: the largest
+  one-minute window observed is $13.2M / 305 events on `xyz:BRENTOIL`, and
+  builder-deployed names outnumber BTC and ETH in event count. The exclusion
+  has good reasons — reflexivity, thin books, oracle-manipulation tail — but it
+  was a default rather than a measurement, and it may be discarding the venue's
+  most cascade-prone instruments. Decide it on evidence.
+
+- **The fade branch is not looking good, on n = 5.** Signed against the forced
+  flow, medians are +2.4 / −2.2 / −0.3 bps at 5/15/60m against ~11 bps round
+  trip. Far too few events to conclude anything, and recorded in `FINDINGS.md`
+  precisely so it is not quietly forgotten if later results look better.
+
 ## Known gaps
 
 - **A partial sweep silently shrinks the map.** `replace_positions` clears the

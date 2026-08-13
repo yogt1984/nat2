@@ -286,19 +286,54 @@ REGISTRY = HOME / "data/registry.sqlite"
 RegistryOpt = Annotated[Path, typer.Option("--registry", help="wallet registry database")]
 
 
-async def _marks_and_oi(testnet: bool = False) -> tuple[dict, dict]:
-    """Mark price and OI notional per coin, from one request."""
+async def _contexts(testnet: bool = False) -> tuple[dict, dict, dict]:
+    """Mark, OI notional and 24h volume per coin, from one request."""
     info = InfoClient(_budget(), testnet=testnet)
     meta, ctxs = await info.meta_and_asset_ctxs()
     await info.aclose()
-    marks, oi = {}, {}
+    marks, oi, volume = {}, {}, {}
     for asset, ctx in zip(meta["universe"], ctxs):
         mark = float(ctx.get("markPx") or 0)
         if not mark:
             continue
-        marks[asset["name"]] = mark
-        oi[asset["name"]] = float(ctx.get("openInterest") or 0) * mark
+        name = asset["name"]
+        marks[name] = mark
+        oi[name] = float(ctx.get("openInterest") or 0) * mark
+        volume[name] = float(ctx.get("dayNtlVlm") or 0)
+    return marks, oi, volume
+
+
+async def _marks_and_oi(testnet: bool = False) -> tuple[dict, dict]:
+    marks, oi, _ = await _contexts(testnet)
     return marks, oi
+
+
+async def _daily_sigma(coin: str, days: int = 7, testnet: bool = False) -> tuple[float | None, int]:
+    """Realized daily volatility from hourly candles, and the candle count.
+
+    Measured rather than assumed: sigma sets the displacement a cascade
+    produces, so a guessed value quietly sets the answer. Returns None when HL
+    returned too little history to say -- a fabricated sigma is worse than an
+    absent one.
+    """
+    import time
+
+    end_ms = int(time.time() * 1000)
+    start_ms = end_ms - days * 24 * 3600 * 1000
+    info = InfoClient(_budget(), testnet=testnet)
+    try:
+        rows = await info.candles(coin, "1h", start_ms, end_ms)
+    finally:
+        await info.aclose()
+    closes = [float(r["c"]) for r in rows or [] if float(r.get("c") or 0) > 0]
+    if len(closes) < 25:
+        return None, len(closes)
+    import math as _math
+
+    returns = [_math.log(b / a) for a, b in zip(closes, closes[1:])]
+    mean = sum(returns) / len(returns)
+    variance = sum((r - mean) ** 2 for r in returns) / (len(returns) - 1)
+    return _math.sqrt(variance) * _math.sqrt(24), len(closes)
 
 
 @wallets_app.command("seed")
@@ -686,13 +721,16 @@ def map_show(
     buckets: Annotated[int, typer.Option(help="rows to display each side")] = 16,
     resolution: Annotated[float, typer.Option(help="bucket width, percent")] = 0.125,
     span: Annotated[float, typer.Option(help="how far from mark to look, percent")] = 10.0,
+    rank: Annotated[bool, typer.Option("--rank", help="score which cluster is worth pushing into")] = False,
+    cost: Annotated[float, typer.Option(help="--rank: round-trip cost, relative")] = 0.001,
+    sigma: Annotated[float, typer.Option(help="--rank: daily vol; 0 measures it from candles")] = 0.0,
 ) -> None:
     """Liquidation map for one coin, with the coverage number that qualifies it."""
     from nat2.core.registry import Registry
     from nat2.features.liqmap import OI_SIDES, build
 
     async def _run() -> None:
-        marks, oi = await _marks_and_oi()
+        marks, oi, volume = await _contexts()
         if coin not in marks:
             console.print(f"[red]{coin} is not a listed perp[/red]")
             raise typer.Exit(1)
@@ -738,8 +776,77 @@ def map_show(
                 "the bars are scaled to the largest bucket displayed, not the largest one"
             )
         console.print(f"{bands}")
+        if rank:
+            await _print_rank(positions, coin, marks[coin], volume.get(coin, 0.0), cost, sigma)
 
     asyncio.run(_run())
+
+
+async def _print_rank(
+    positions, coin: str, mark: float, day_volume: float, cost: float, sigma: float
+) -> None:
+    """Which cluster is worth pushing into -- the map ranks nothing by itself.
+
+    The tallest bar is rarely the answer: walk cost grows linearly in distance
+    while a cascade's displacement grows as the square root of mass, so a
+    smaller near cluster routinely outranks a larger far one.
+    """
+    from nat2.features.attack import DEFAULT_KAPPA, DEFAULT_OMEGA_CROSS, signal
+
+    measured = 0
+    if sigma <= 0:
+        sigma, measured = await _daily_sigma(coin)
+        if sigma is None:
+            console.print(
+                f"[yellow]cannot rank[/yellow]: HL returned {measured} hourly candle(s), "
+                "too few to measure volatility -- pass --sigma to assert one"
+            )
+            return
+    if day_volume <= 0:
+        console.print("[yellow]cannot rank[/yellow]: no 24h volume for this coin")
+        return
+
+    result = signal(positions, coin, mark, sigma, day_volume, cost, hinge=False)
+    if result is None:
+        console.print("[yellow]cannot rank[/yellow]: inputs missing")
+        return
+
+    table = Table(title=f"{coin} — which cluster is worth pushing into")
+    for col in ("side", "psi", "conc", "d*", "mass", "n", ""):
+        table.add_column(col, justify="right")
+    for name, reach in (("up", result.up), ("down", result.down)):
+        distance = f"{reach.distance:+.2%}" if reach.distance is not None else "--"
+        verdict = "[green]viable[/green]" if reach.viable else ""
+        table.add_row(
+            name,
+            f"{reach.psi:.3f}",
+            f"{reach.concentration:.0%}",
+            distance,
+            f"${reach.mass / 1e6:,.1f}M",
+            str(reach.positions),
+            verdict,
+        )
+    console.print(table)
+
+    if result.abstain:
+        console.print(
+            "[yellow]fuel on both sides[/yellow] -- a volatility state, not a direction"
+        )
+    worst = max(result.up.concentration, result.down.concentration)
+    if worst >= 0.9:
+        console.print(
+            f"[yellow]{worst:.0%} of a reading rests on one position[/yellow] -- "
+            "a supremum is brittle, and this one is a single wallet"
+        )
+    console.print(
+        f"[dim]sigma {sigma:.2%}/day ({'measured, ' + str(measured) + ' candles' if measured else 'asserted'}), "
+        f"volume ${day_volume / 1e6:,.0f}M/day, cost {cost:.2%} round trip, "
+        f"kappa {DEFAULT_KAPPA:g}, omega_cross {DEFAULT_OMEGA_CROSS:g}[/dim]"
+    )
+    console.print(
+        "[dim]psi > 1 means a push into that side pays for itself. Unfitted: A = 1 and the "
+        "cost is asserted, so the level is not yet a claim -- the ordering is.[/dim]"
+    )
 
 
 def _map_row(table, bucket, mark: float, peak: float) -> None:

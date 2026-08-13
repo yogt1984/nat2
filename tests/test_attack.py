@@ -180,6 +180,16 @@ def test_reflection_symmetry():
     assert up.psi == pytest.approx(down.psi, rel=1e-9)
 
 
+def test_distance_is_signed_by_side():
+    # An unsigned magnitude reads as a real number pointing the wrong way: a
+    # cluster 3% *below* the mark rendering as +3% is exactly the answer that
+    # looks right and is not.
+    up = _ratio([_position(105.0, 100_000.0)], side=UP)
+    down = _ratio([_position(95.0, 100_000.0)], side=DOWN)
+    assert up.distance == pytest.approx(0.05)
+    assert down.distance == pytest.approx(-0.05)
+
+
 def test_mass_above_the_mark_drives_price_up():
     # THE sign trap. Mass above is shorts; shorts liquidate by buying; forced
     # buying pushes price up. `LiqMap.imbalance()` has the opposite sign, and

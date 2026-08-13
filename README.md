@@ -70,6 +70,8 @@ be evaluated must not pass. The open question is whether the wallets we map and 
 actually get liquidated are the same population; `nat2 cycle` is accumulating the series that
 settles it.
 
+- [`ASKING.md`](ASKING.md) — how to read the liquidation map: what to ask, which flags are not
+  cosmetic, and the five ways to get a plausible wrong answer.
 - [`docs/DESIGN.md`](docs/DESIGN.md) — the full design: capture, features, experts, meta,
   allocation, execution, milestones, and the risks worth naming.
 - [`TASKS.md`](TASKS.md) — what is next, what it unblocks, and what is still unverified.

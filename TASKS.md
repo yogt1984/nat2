@@ -65,7 +65,19 @@ decide until then.
 This also qualifies the map itself: 31% coverage *by notional* may correspond to
 far less than 31% of liquidation *events*. Coverage is now reported both ways.
 
-## 2. Run capture continuously — unblocks everything
+## 2. ~~Run capture continuously~~ — running since 2026-08-13, day 1 of the clock
+
+`nat2-capture` and `nat2-cycle` are systemd user units under
+[`packaging/systemd`](packaging/systemd/), enabled with linger. Capture runs 18 coins
+(`--all --min-volume 5000000`) and recycles every 6h — a workaround for the unexplained
+long-run degradation below, safe only because a restart opens a new WORM part.
+
+**Every date in `HYPOTHESIS_1.md` §8 is measured from 2026-08-13.** The 1h cell is readable
+around 2026-08-27; the 4h cell around 2026-09-17.
+
+Original note follows.
+
+
 
 Nothing downstream can be validated on data we don't own, and `predictive`
 needs map snapshots *followed by* liquidation prints. Capture accrues calendar

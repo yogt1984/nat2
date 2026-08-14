@@ -1,0 +1,32 @@
+[Unit]
+Description=nat2 SMA crossover watcher — notifies, does not trade
+Documentation=file:///home/onat/nat2/tools/sma_watch.py
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/onat/nat2
+Environment=NAT2_HOME=/home/onat/nat2
+
+# TEMPLATE -- not enabled by default. Set your own topic before installing.
+# The ntfy topic name IS the password: there is no sign-up, so anyone who
+# guesses it reads your trading signals. Use something long and random, and
+# keep it out of git -- prefer an EnvironmentFile with mode 600 over putting
+# it here.
+#
+#   systemctl --user edit nat2-sma-watch    # add Environment=NTFY_TOPIC=...
+#
+Environment=NTFY_TOPIC=CHANGE-ME
+
+# 1d bars mean the signal updates once a day at UTC midnight, so polling more
+# often than hourly buys nothing. --band is the anti-whipsaw margin in percent:
+# price must clear the SMA by this much before a cross counts.
+ExecStart=/home/onat/.local/bin/uv run /home/onat/nat2/tools/sma_watch.py ETH \
+    --periods 31 --interval 1d --band 0.3 --poll 3600
+
+Restart=always
+RestartSec=60
+
+[Install]
+WantedBy=default.target

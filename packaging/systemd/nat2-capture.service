@@ -18,7 +18,16 @@ ExecStart=/home/onat/.local/bin/nat2 capture hl --all --min-volume 5000000
 # This is a workaround for an unexplained defect, not a fix, and it is safe only
 # because a restart opens a NEW WORM part -- a closed file is never reopened, so
 # a recycle can never be mistaken for tampering.
-RuntimeMaxSec=6h
+#
+# 5h, not 6h, and the difference is load-bearing. At 6h this harmonised exactly
+# with `nat2 cycle --snapshot-every 6h` launched at the same instant, so every
+# recycle landed on a registry sweep. A restarting daemon needs one
+# metaAndAssetCtxs call to resolve --all, and waited ~6 minutes behind a
+# 3,601-wallet sweep holding the IP weight budget -- punching 370s holes in
+# trades and l2book at 21:19 and 03:19 on the first day, which FAILed
+# `gate feed` on no_gaps. An odd period drifts against the sweep rather than
+# colliding with it every time.
+RuntimeMaxSec=5h
 Restart=always
 RestartSec=10
 

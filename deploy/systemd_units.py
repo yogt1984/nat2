@@ -24,6 +24,8 @@ CAPTURE_UNIT = "nat2-capture.service"
 CYCLE_UNIT = "nat2-cycle.service"
 GAPWATCH_UNIT = "nat2-gapwatch.service"
 GAPWATCH_TIMER = "nat2-gapwatch.timer"
+EVLOG_UNIT = "nat2-evlog.service"
+EVLOG_TIMER = "nat2-evlog.timer"
 # Non-guessable alert channel (TASK_2/TASKS/01); subscribe to it in the ntfy app.
 NTFY_TOPIC = "nat2-ops-0db264232a4c36cd56e4"
 
@@ -60,7 +62,31 @@ OnUnitActiveSec=5min
 [Install]
 WantedBy=timers.target
 """
-    return {GAPWATCH_UNIT: gapwatch, GAPWATCH_TIMER: gapwatch_timer}
+    # Event-timeline logger (TASK_2/05): oneshot poll on the project venv
+    # (needs httpx), 5 min cadence; gapwatch pages if its state goes stale.
+    evlog = f"""\
+[Unit]
+Description=nat2 evlog (point-in-time public-event log)
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory={root}
+ExecStart={root / ".venv" / "bin" / "python"} {root / "deploy" / "evlog" / "evlog.py"} once
+"""
+    evlog_timer = """\
+[Unit]
+Description=nat2 evlog timer (5 min)
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=5min
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target
+"""
+    return {GAPWATCH_UNIT: gapwatch, GAPWATCH_TIMER: gapwatch_timer, EVLOG_UNIT: evlog, EVLOG_TIMER: evlog_timer}
 
 
 def install() -> None:
@@ -77,7 +103,7 @@ def install() -> None:
         print(f"wrote {unit_dir / name}")
     subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
     subprocess.run(
-        ["systemctl", "--user", "enable", "--now", CAPTURE_UNIT, CYCLE_UNIT, GAPWATCH_TIMER],
+        ["systemctl", "--user", "enable", "--now", CAPTURE_UNIT, CYCLE_UNIT, GAPWATCH_TIMER, EVLOG_TIMER],
         check=True,
     )
     subprocess.run(["loginctl", "enable-linger"], check=False)

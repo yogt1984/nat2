@@ -27,6 +27,8 @@ ROOT = Path(__file__).resolve().parent.parent
 MANIFEST = ROOT / "data" / "raw" / "_manifest.jsonl"
 LEDGER = ROOT / "data" / "ledger.jsonl"
 STATE_PATH = ROOT / "data" / "ops" / "gapwatch_state.json"
+EVLOG_STATE = ROOT / "data" / "ops" / "evlog_state.json"
+EVLOG_CADENCE_S = 300.0  # nat2-evlog.timer; the events stream is a poll, not a file rotation
 
 # Cadences measured from manifest history 2026-08-07..20 (median inter-entry
 # interval): ws streams rotate hourly (3600 s median, n=84 for trades and
@@ -91,6 +93,12 @@ def conditions(now_s: float) -> dict[str, tuple[bool, str]]:
     """{check_name: (bad, detail)} for every watched condition."""
     conds: dict[str, tuple[bool, str]] = {}
     ages = newest_ingest()
+    try:
+        last_poll = json.loads(EVLOG_STATE.read_text())["last_poll_ns"] / 1e9
+    except (OSError, ValueError, KeyError):
+        last_poll = 0.0
+    age = now_s - last_poll
+    conds["stream:events"] = (age > GAP_FACTOR * EVLOG_CADENCE_S, f"age {age / 60:.0f}m")
     for stream, cadence in CADENCE_S.items():
         age = now_s - ages.get(stream, 0.0)
         conds[f"stream:{stream}"] = (age > GAP_FACTOR * cadence, f"age {age / 60:.0f}m")

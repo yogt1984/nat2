@@ -9,6 +9,8 @@ is the lookahead this system exists to prevent.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from nat2.core.registry import Registry
@@ -319,27 +321,38 @@ def _snap(t_ingest: int, mark: float = 100.0, up=None, down=None, coin="BTC") ->
             "down": {str(b): down.get(b, 0.0) for b in BANDS}}
 
 
-def _gate(tmp_path, events, positions, series=None, **kw):
+def _gate(tmp_path, events, positions, series=None, window_n=30):
+    """Pre-register (as TASK_2/03 did), then run the gate on events that
+    postdate the registration -- the only events the verdict may use."""
     from nat2.features.liqmap import build
 
+    ledger = Ledger(tmp_path / "l.jsonl")
+    ledger.append("preregistration", {"name": "map_per_position_threshold", "pass_if": ">= 0.60",
+                                      "window": {"n": window_n}})
+    ledger.append("preregistration", {"name": "map_cluster_threshold", "window": {"n": window_n},
+                                      "pass_if": {"side_hit_rate": ">= 0.60 with z >= 3 vs 0.50",
+                                                  "band_hit_rate": "exceeds permutation-null mean by z >= 3"}})
+    start = ledger.append("preregistration", {"name": "magnet_runnable_when"}).ts
     registry = Registry(tmp_path / "r.sqlite")
     registry.replace_positions([(p, "published") for p in positions])
-    registry.record_liquidations(events)
+    registry.record_liquidations([replace(e, t_event=e.t_event + start) for e in events])
+    series = {c: [{**r, "t_ingest": r["t_ingest"] + start} for r in rows] for c, rows in (series or {}).items()}
     liqmap = build(registry.positions("BTC"), "BTC", 100.0, oi_notional=1.0)
-    verdict, checks = gate_map.run(
-        registry, [liqmap], Ledger(tmp_path / "l.jsonl"), map_series=series or {}, **kw
-    )
+    gate_map.WINDOW_EVENTS, gate_map.PERMUTATIONS = window_n, 200
+    try:
+        verdict, checks = gate_map.run(registry, [liqmap], ledger, map_series=series)
+    finally:
+        gate_map.WINDOW_EVENTS, gate_map.PERMUTATIONS = 1000, 1000
     return verdict, {c.name: c for c in checks}
 
 
-def test_gate_rejects_a_perfect_but_tiny_sample(tmp_path):
-    # Three lucky hits is not a validated map.
+def test_gate_refuses_a_perfect_but_tiny_sample(tmp_path):
+    # Three lucky hits is not a validated map: the registered window is not filled.
     events = [_event(tid=i, t_event=50, mark_px=99.7) for i in range(3)]
     series = {"BTC": [_snap(1, down={0.005: 1e6})]}
-    _verdict, checks = _gate(tmp_path, events, [_position(liquidation_px=95.0)],
-                             series=series, min_events=30)
-    assert not checks["predictive"].passed
-    assert "insufficient history" in checks["predictive"].detail
+    verdict, checks = _gate(tmp_path, events, [_position(liquidation_px=95.0)], series=series)
+    assert not verdict.passed and verdict.detail["verdict"] == "refused"
+    assert "window not filled: 3/30" in checks["window"].detail
 
 
 def test_gate_rejects_a_side_hit_rate_no_better_than_a_coin_flip(tmp_path):
@@ -348,34 +361,38 @@ def test_gate_rejects_a_side_hit_rate_no_better_than_a_coin_flip(tmp_path):
     events = [_event(tid=i, t_event=50 + i, mark_px=99.7 if i % 2 else 100.3)
               for i in range(40)]
     series = {"BTC": [_snap(1, down={0.005: 1e6}, up={0.005: 1.0})]}
-    _verdict, checks = _gate(tmp_path, events, [_position(liquidation_px=95.0)],
-                             series=series, min_events=30)
-    assert not checks["predictive"].passed
-    assert checks["predictive"].stats["side_hit_rate"] == pytest.approx(0.5)
+    verdict, checks = _gate(tmp_path, events, [_position(liquidation_px=95.0)], series=series)
+    assert not checks["cluster"].passed and not verdict.passed
+    assert checks["cluster"].stats["side_hit_rate"] == pytest.approx(0.5)
 
 
-def test_gate_passes_predictive_when_the_map_calls_the_side(tmp_path):
-    events = [_event(tid=i, t_event=50 + i, mark_px=99.7) for i in range(40)]
-    series = {"BTC": [_snap(1, down={0.005: 1e6}, up={0.005: 1.0})]}
-    _verdict, checks = _gate(tmp_path, events, [_position(liquidation_px=95.0)],
-                             series=series, min_events=30)
-    assert checks["predictive"].passed
-    assert checks["predictive"].stats["side_baseline"] == 0.5
+def test_gate_passes_on_the_cluster_component_when_the_map_calls_the_side(tmp_path, monkeypatch):
+    # The single fixture position derives poorly; fidelity is not under test here.
+    monkeypatch.setattr(gate_map, "validate", lambda _: {"n": 1, "exact_frac": 1.0, "median": 0.0})
+    # One snapshot per event: the permutation null's unit of independence is
+    # the snapshot, so forty hits on a single map would be one draw, not forty.
+    events = [_event(tid=i, t_event=50 + 10 * i, mark_px=99.7) for i in range(40)]
+    series = {"BTC": [_snap(45 + 10 * i, down={0.005: 1e6}, up={0.005: 1.0}) for i in range(40)]}
+    verdict, checks = _gate(tmp_path, events, [_position(liquidation_px=95.0)], series=series)
+    assert checks["cluster"].passed and verdict.passed
+    assert checks["cluster"].stats["side_baseline"] == 0.5
+    assert checks["cluster"].stats["band_null"]["z"] > 3  # 2 of 8 slots carry mass; null ~0.25
 
 
-def test_gate_predictive_fails_without_any_map_history(tmp_path):
+def test_gate_refuses_without_any_map_history(tmp_path):
     events = [_event(tid=i, t_event=50 + i) for i in range(40)]
-    _verdict, checks = _gate(tmp_path, events, [_position(liquidation_px=95.0)])
-    assert not checks["predictive"].passed
-    assert checks["predictive"].stats["no_map"] == 40
+    verdict, checks = _gate(tmp_path, events, [_position(liquidation_px=95.0)])
+    assert verdict.detail["verdict"] == "refused"
+    assert verdict.detail["cumulative"]["predictive"]["no_map"] == 40
 
 
-def test_gate_records_the_predictive_summary_to_the_ledger(tmp_path):
+def test_gate_records_the_cumulative_summary_and_the_seqs_to_the_ledger(tmp_path):
     _gate(tmp_path, [_event(tid=1, t_event=50, mark_px=99.7)],
           [_position(liquidation_px=95.0)],
           series={"BTC": [_snap(1, down={0.005: 1e6})]})
     entry = Ledger(tmp_path / "l.jsonl").latest("gate", gate="map")
-    assert entry.payload["detail"]["predictive"]["scored"] == 1
+    assert entry.payload["detail"]["cumulative"]["predictive"]["scored"] == 1
+    assert entry.payload["detail"]["judged_against"] == [0, 1, 2]
     assert Ledger(tmp_path / "l.jsonl").verify()[0]
 
 

@@ -398,40 +398,16 @@ def score_clusters(
     mark measures elapsed price movement and calls it a prediction, so a map
     older than `max_age_ns` is set aside and counted rather than used.
     """
-    from nat2.io.mapsnap import as_of
-
     result = ClusterScore()
-    for event in events:
+    for kind, event, snap, slot in match_slots(events, rows_by_coin, bands, max_age_ns):
         result.events += 1
-        rows = rows_by_coin.get(event.coin)
-        if not rows:
-            result.no_map += 1
+        if kind != "scored":
+            setattr(result, kind, getattr(result, kind) + 1)
             continue
-        # Strictly before: a snapshot taken at the same nanosecond as the
-        # liquidation may already contain its consequences.
-        snap = as_of(rows, event.t_event - 1)
-        if snap is None:
-            result.pre_map += 1
-            continue
-        mark = snap.get("mark") or 0.0
-        if mark <= 0:
-            result.no_map += 1
-            continue
-        if max_age_ns and event.t_event - snap["t_ingest"] > max_age_ns:
-            result.stale_map += 1
-            continue
-
-        offset = event.mark_px / mark - 1
-        band = _band_for(abs(offset), bands)
-        if band is None:
-            result.outside_span += 1
-            continue
-
-        key = str(band)
+        side, key, offset = slot
         up = float((snap.get("up") or {}).get(key) or 0.0)
         down = float((snap.get("down") or {}).get(key) or 0.0)
-        here, there = (up, down) if offset >= 0 else (down, up)
-
+        here, there = (up, down) if side == "up" else (down, up)
         result.scored += 1
         result.distances.append(abs(offset))
         if here > min_notional:
@@ -439,6 +415,85 @@ def score_clusters(
         if here > there:
             result.side_hits += 1
     return result
+
+
+def match_slots(events, rows_by_coin, bands=(0.005, 0.01, 0.02, 0.05), max_age_ns: int = MAX_MAP_AGE_NS):
+    """Yield (kind, event, snap, (side, band_key, offset)) per event; `kind` is
+    "scored" or the set-aside bucket name. The one place the causality rule lives."""
+    from nat2.io.mapsnap import as_of
+
+    for event in events:
+        rows = rows_by_coin.get(event.coin)
+        if not rows:
+            yield "no_map", event, None, None
+            continue
+        # Strictly before: a snapshot taken at the same nanosecond as the
+        # liquidation may already contain its consequences.
+        snap = as_of(rows, event.t_event - 1)
+        if snap is None:
+            yield "pre_map", event, None, None
+            continue
+        mark = snap.get("mark") or 0.0
+        if mark <= 0:
+            yield "no_map", event, None, None
+            continue
+        if max_age_ns and event.t_event - snap["t_ingest"] > max_age_ns:
+            yield "stale_map", event, snap, None
+            continue
+        offset = event.mark_px / mark - 1
+        band = _band_for(abs(offset), bands)
+        if band is None:
+            yield "outside_span", event, snap, None
+            continue
+        yield "scored", event, snap, ("up" if offset >= 0 else "down", str(band), offset)
+
+
+@dataclass
+class BandNull:
+    """`band_hit_rate` against its bucket-permutation null (ledger seq 118):
+    the masses of each matched snapshot are shuffled across its (side, band)
+    slots, preserving the multiset, and the hit rate is recomputed M times."""
+    observed: float
+    null_mean: float
+    null_sd: float
+    permutations: int
+    informative: bool  # False when no permutation can change the answer
+
+    @property
+    def z(self) -> float:
+        return (self.observed - self.null_mean) / self.null_sd if self.null_sd > 0 else 0.0
+
+    def summary(self) -> dict:
+        return {"band_hit_rate": self.observed, "null_mean": self.null_mean, "null_sd": self.null_sd,
+                "z": self.z, "permutations": self.permutations, "informative": self.informative}
+
+
+def band_null(events, rows_by_coin, permutations: int = 1000, seed: int = 118,
+              min_notional: float = 0.0, **match_kw) -> BandNull | None:
+    import random
+
+    matched = [(id(snap), snap, slot) for kind, _, snap, slot in match_slots(events, rows_by_coin, **match_kw)
+               if kind == "scored"]
+    if not matched:
+        return None
+    slots = [(s, b) for s in ("up", "down") for b in ("0.005", "0.01", "0.02", "0.05")]
+    masses = {sid: [float((snap.get(s) or {}).get(b) or 0.0) for s, b in slots] for sid, snap, _ in matched}
+    index = {sl: i for i, sl in enumerate(slots)}
+    want = [(sid, index[(slot[0], slot[1])]) for sid, _, slot in matched]
+    hit = lambda table: sum(1 for sid, i in want if table[sid][i] > min_notional) / len(want)  # noqa: E731
+    observed = hit(masses)
+    rng = random.Random(seed)
+    draws = []
+    for _ in range(permutations):
+        shuffled = {}
+        for sid, m in masses.items():
+            m = list(m)
+            rng.shuffle(m)
+            shuffled[sid] = m
+        draws.append(hit(shuffled))
+    mean = sum(draws) / len(draws)
+    sd = (sum((d - mean) ** 2 for d in draws) / len(draws)) ** 0.5
+    return BandNull(observed, mean, sd, permutations, informative=sd > 0)
 
 
 def method_notional(events) -> dict[str, float]:

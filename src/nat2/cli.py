@@ -1106,5 +1106,25 @@ def log_query(
         )
 
 
+OPERATOR_KINDS = ("preregistration", "incident")
+
+
+@log_app.command("add")
+def log_add(
+    kind: Annotated[str, typer.Option("--kind")],
+    payload: Annotated[str, typer.Option("--json", help="payload as a JSON object")],
+    ledger: LedgerOpt = LEDGER,
+) -> None:
+    """Append an operator entry. Only pre-registrations and incidents -- never
+    observations or gate results, which only their producing code may write."""
+    if kind not in OPERATOR_KINDS:
+        raise typer.BadParameter(f"kind must be one of {OPERATOR_KINDS}, not {kind!r}")
+    body = json.loads(payload)
+    if not isinstance(body, dict):
+        raise typer.BadParameter("--json must be a JSON object")
+    entry = Ledger(ledger).append(kind, body)
+    console.print(f"appended seq {entry.seq} kind={kind} name={body.get('name', '-')}")
+
+
 if __name__ == "__main__":
     app()

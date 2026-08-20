@@ -235,6 +235,12 @@ class Registry:
             row = conn.execute("SELECT MAX(t_ingest) t FROM positions").fetchone()
         return row["t"] if row and row["t"] else None
 
+    def published_ts(self) -> int | None:
+        """Epoch of the last *sweep* alone. `positions_ts` moves with every replay."""
+        with closing(self._connect()) as conn:
+            row = conn.execute("SELECT MAX(t_ingest) t FROM positions WHERE source = 'published'").fetchone()
+        return row["t"] if row and row["t"] else None
+
     # --- liquidations ----------------------------------------------------
 
     def record_liquidations(self, events) -> int:

@@ -84,6 +84,57 @@ liquidated wallet no longer holds the position, so a snapshot taken afterwards
 had nothing to predict. Separating "different populations" from "we looked too
 late" needs the snapshot-then-observe cycle, not more analysis.
 
+## Cascades, and the first look at whether fading one pays
+
+**A wider observer set finds 6.5× more liquidations.** *(2026-08-13)* 200 observers,
+53 productive, yielded **1,289 events** spanning 2024-08-11 → 2026-08-13, $26.3M
+of notional. Median event is **$2,000**; p90 is $38,346. The observer count is
+the binding constraint on census size, not the registry.
+
+**Cascades are rare and power-law distributed.** Bucketed into one-minute
+windows: **52 windows ≥ $25k, 12 ≥ $100k, 3 ≥ $1M.** The single largest is
+$13.2M across 305 events (2026-08-10 17:00).
+
+**The largest cascades are in instruments the design excludes.** That $13.2M
+window is `xyz:BRENTOIL`, a builder-deployed perp, and builder-deployed names
+dominate the event count (BRENTOIL 309, CBRS 91, CXMT 44) against BTC 190 and
+ETH 181. `DESIGN.md` excludes builder-deployed perps by default. That exclusion
+may be discarding exactly the venue's most cascade-prone instruments, and it is
+now an open question rather than a settled default.
+
+**One backstop liquidation, out of 1,288.** The first non-`market` method
+observed. Even the $3.8M ETH minute was absorbed by the book unaided — so the
+liquidity to take the other side of forced flow is already there, and whoever
+supplies it is doing so passively.
+
+**First reversion measurement: the fade does not clear cost.** *(2026-08-13)*
+Windows ≥ $100k, builder-deployed excluded, signed against the forced flow so
+positive means the fade wins:
+
+| horizon | median | mean | wins | n |
+|---|---|---|---|---|
+| +5m | +2.4 bps | −0.1 | 2/3 | 3 |
+| +15m | −2.2 bps | +4.5 | 2/5 | 5 |
+| +60m | −0.3 bps | −9.5 | 2/5 | 5 |
+
+Against a measured ~11 bps round trip, **nothing clears**. The two material ETH
+cascades were both preceded by declines and continued down afterwards (−48 and
+−72 bps at 15m and 60m on the larger); the snapback the magnet thesis predicts
+is not visible in them.
+
+*This is n = 5 and settles nothing.* It is recorded because it is the first
+evidence in either direction, and because it points *away* from the branch that
+had the better mechanism story. Two known weaknesses: the direction is proxied
+by the pre-event return because liquidation side is not persisted, and three of
+eight qualifying windows were unreachable because their candles had expired.
+
+**Venue history caps, confirmed.** *(2026-08-13)* ~5000 bars per interval, as
+the sibling project measured independently: **1m reaches 3.6 days**, 5m 17.5,
+15m 52.2, 1h 208.4. So a cascade's minute structure is unrecoverable after
+~3.5 days and any cascade older than ~7 months is invisible at any resolution.
+This is what makes running capture urgent rather than merely important — the
+data is not delayed, it is deleted.
+
 ## Liquidation mathematics
 
 **Our derivation does not reproduce HL's published `liquidationPx`.**

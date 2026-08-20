@@ -1,0 +1,35 @@
+[Unit]
+Description=nat2 capture — HL tape, WORM, dual-timestamped
+Documentation=file:///home/onat/nat2/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/onat/nat2
+Environment=NAT2_HOME=/home/onat/nat2
+ExecStart=/home/onat/.local/bin/nat2 capture hl --all --min-volume 5000000
+
+# Capture degrades over long runs: FINDINGS records 1,737 reconnects and a 49%%
+# failure rate on metaAndAssetCtxs after 19.5h, producing 846 context records
+# where ~4,700 were expected. Cause unknown; a restart on the same code gave 0
+# errors. So recycle well inside that window until the cause is found.
+#
+# This is a workaround for an unexplained defect, not a fix, and it is safe only
+# because a restart opens a NEW WORM part -- a closed file is never reopened, so
+# a recycle can never be mistaken for tampering.
+#
+# 5h, not 6h, and the difference is load-bearing. At 6h this harmonised exactly
+# with `nat2 cycle --snapshot-every 6h` launched at the same instant, so every
+# recycle landed on a registry sweep. A restarting daemon needs one
+# metaAndAssetCtxs call to resolve --all, and waited ~6 minutes behind a
+# 3,601-wallet sweep holding the IP weight budget -- punching 370s holes in
+# trades and l2book at 21:19 and 03:19 on the first day, which FAILed
+# `gate feed` on no_gaps. An odd period drifts against the sweep rather than
+# colliding with it every time.
+RuntimeMaxSec=5h
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target

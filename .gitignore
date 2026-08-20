@@ -5,3 +5,4 @@ __pycache__/
 .pytest_cache/
 junk
 .nat2
+data/sma_watch/

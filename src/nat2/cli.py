@@ -1069,6 +1069,28 @@ def _map_row(table, bucket, mark: float, peak: float) -> None:
     )
 
 
+@gate_app.command("magnet")
+def gate_magnet(
+    root: RootOpt = RAW, registry: RegistryOpt = REGISTRY, ledger: LedgerOpt = LEDGER,
+    placebo: Annotated[int, typer.Option(help="permutation replications per cell")] = 200,
+) -> None:
+    """Run gate `magnet`: cluster pull vs sign(imb), net of costs -- refuses until pre-registered N."""
+    from nat2.core.registry import Registry
+    from nat2.gates import magnet as gate
+    from nat2.io.mapsnap import STREAM, iter_snapshots
+    from nat2.io.worm import read_records
+
+    reg, chain = Registry(registry), Ledger(ledger)
+    history: dict[str, list[dict]] = {}
+    for row in iter_snapshots(read_records(root, STREAM)):
+        history.setdefault(row["coin"], []).append(row)
+    coverage = (latest_verdict(chain, "map") or gate.Verdict("map", False, {}, 0)).detail.get("coverage", {})
+    verdict = gate.run(chain, reg.liquidations(), history, coverage,
+                       gate.cell_evaluator(root, reg, placebo), HOME)
+    console.print(json.dumps({"passed": verdict.passed, **verdict.detail}, default=str))
+    raise typer.Exit(0 if verdict.passed else 1)
+
+
 @gate_app.command("map")
 def gate_map(
     coins: Annotated[str, typer.Option("--coins")] = "BTC,ETH,SOL",

@@ -23,6 +23,10 @@ NAT2_BIN = ROOT / ".venv" / "bin" / "nat2"
 
 CAPTURE_UNIT = "nat2-capture.service"
 CYCLE_UNIT = "nat2-cycle.service"
+GAPWATCH_UNIT = "nat2-gapwatch.service"
+GAPWATCH_TIMER = "nat2-gapwatch.timer"
+# Non-guessable alert channel (TASK_2/TASKS/01); subscribe to it in the ntfy app.
+NTFY_TOPIC = "nat2-ops-0db264232a4c36cd56e4"
 
 
 def render_units(root: Path = ROOT, nat2_bin: Path = NAT2_BIN) -> dict[str, str]:
@@ -62,7 +66,36 @@ RestartSec=10
 [Install]
 WantedBy=default.target
 """
-    return {CAPTURE_UNIT: capture, CYCLE_UNIT: cycle}
+    # Watchdog: timer-driven oneshot, stdlib-only script run with the system
+    # python3 so it cannot die with a deleted venv (nat's gap-alert failure mode).
+    gapwatch = f"""\
+[Unit]
+Description=nat2 gapwatch (manifest-gap + ops watchdog, ntfy alerts)
+
+[Service]
+Type=oneshot
+WorkingDirectory={root}
+Environment="NAT2_NTFY_TOPIC={NTFY_TOPIC}"
+ExecStart=/usr/bin/python3 {root / "deploy" / "gapwatch.py"} check
+"""
+
+    gapwatch_timer = f"""\
+[Unit]
+Description=nat2 gapwatch timer (5 min)
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+
+[Install]
+WantedBy=timers.target
+"""
+    return {
+        CAPTURE_UNIT: capture,
+        CYCLE_UNIT: cycle,
+        GAPWATCH_UNIT: gapwatch,
+        GAPWATCH_TIMER: gapwatch_timer,
+    }
 
 
 def install() -> None:
@@ -75,7 +108,8 @@ def install() -> None:
         print(f"wrote {unit_dir / name}")
     subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
     subprocess.run(
-        ["systemctl", "--user", "enable", "--now", CAPTURE_UNIT, CYCLE_UNIT], check=True
+        ["systemctl", "--user", "enable", "--now", CAPTURE_UNIT, CYCLE_UNIT, GAPWATCH_TIMER],
+        check=True,
     )
     subprocess.run(["loginctl", "enable-linger"], check=False)
     print("units enabled and started; linger requested")

@@ -1,0 +1,17 @@
+# nat2 status page (TASK_2/06, C0). One site block, file_server only.
+# Production (Hetzner): replace the host line with the real domain; caddy then
+# obtains a Let's Encrypt cert automatically and redirects HTTP->HTTPS.
+# Local validation: `caddy run --config deploy/Caddyfile` uses the internal CA.
+# Credential: replace the hash with `caddy hash-password` output (never plaintext).
+{
+	admin off
+}
+
+status.localhost {
+	basic_auth {
+		nat2 $2a$14$REPLACE_WITH_caddy_hash-password_OUTPUT
+	}
+	root * /home/onat/www/status
+	file_server
+	header Cache-Control "no-store"
+}

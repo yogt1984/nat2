@@ -1,5 +1,6 @@
 """Install systemd --user units for nat2: capture + cycle (static files in
-``packaging/systemd/``) and the gapwatch oneshot + timer (rendered here).
+``packaging/systemd/``) and the gapwatch / evlog / statuspage oneshots + timers
+(rendered here).
 
 Pure render function (unit-testable, no host writes) + an ``install`` entry
 point that writes the units to ``~/.config/systemd/user/`` and enables them.
@@ -26,6 +27,9 @@ GAPWATCH_UNIT = "nat2-gapwatch.service"
 GAPWATCH_TIMER = "nat2-gapwatch.timer"
 EVLOG_UNIT = "nat2-evlog.service"
 EVLOG_TIMER = "nat2-evlog.timer"
+STATUSPAGE_UNIT = "nat2-statuspage.service"
+STATUSPAGE_TIMER = "nat2-statuspage.timer"
+STATUS_DIR = Path.home() / "www" / "status"
 # Non-guessable alert channel (TASK_2/TASKS/01); subscribe to it in the ntfy app.
 NTFY_TOPIC = "nat2-ops-0db264232a4c36cd56e4"
 
@@ -86,7 +90,33 @@ AccuracySec=5s
 [Install]
 WantedBy=timers.target
 """
-    return {GAPWATCH_UNIT: gapwatch, GAPWATCH_TIMER: gapwatch_timer, EVLOG_UNIT: evlog, EVLOG_TIMER: evlog_timer}
+    # Status page (TASK_2/06): read-only generator on the system python3 (stdlib
+    # only), 10 min cadence, atomic write into the dir caddy serves.
+    statuspage = f"""\
+[Unit]
+Description=nat2 statuspage (static HTML generator, reads files only)
+
+[Service]
+Type=oneshot
+WorkingDirectory={root}
+ExecStart=/usr/bin/python3 {root / "deploy" / "statuspage.py"} --out {STATUS_DIR / "status.html"}
+"""
+    statuspage_timer = """\
+[Unit]
+Description=nat2 statuspage timer (10 min)
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=10min
+
+[Install]
+WantedBy=timers.target
+"""
+    return {
+        GAPWATCH_UNIT: gapwatch, GAPWATCH_TIMER: gapwatch_timer,
+        EVLOG_UNIT: evlog, EVLOG_TIMER: evlog_timer,
+        STATUSPAGE_UNIT: statuspage, STATUSPAGE_TIMER: statuspage_timer,
+    }
 
 
 def install() -> None:
@@ -103,7 +133,7 @@ def install() -> None:
         print(f"wrote {unit_dir / name}")
     subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
     subprocess.run(
-        ["systemctl", "--user", "enable", "--now", CAPTURE_UNIT, CYCLE_UNIT, GAPWATCH_TIMER, EVLOG_TIMER],
+        ["systemctl", "--user", "enable", "--now", CAPTURE_UNIT, CYCLE_UNIT, GAPWATCH_TIMER, EVLOG_TIMER, STATUSPAGE_TIMER],
         check=True,
     )
     subprocess.run(["loginctl", "enable-linger"], check=False)

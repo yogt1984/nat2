@@ -1,0 +1,30 @@
+<!doctype html>
+<meta charset="utf-8"><meta http-equiv="refresh" content="600">
+<title>nat2 status</title>
+<style>
+body{font:14px/1.4 system-ui,sans-serif;max-width:760px;margin:2em auto;padding:0 1em;color:#222}
+h1,h2{font-weight:600} h2{margin-top:1.6em;border-bottom:1px solid #ddd}
+table{border-collapse:collapse;width:100%} td,th{text-align:left;padding:.25em .5em;border-bottom:1px solid #eee}
+.m{font-weight:600} .asof{color:#888;font-size:.8em;margin-left:.4em} .asof::before{content:"as of "}
+.pass{color:#2a7} .fail,.bad{color:#c22} .warn{color:#b70} .grid{stroke:#ddd} .tick{font-size:10px;fill:#888}
+.legend{font-size:.85em} code{background:#f4f4f4;padding:0 .2em}
+</style>
+<h1>nat2 status</h1>
+<p>generated <span class="m ">2025-08-12 12:00Z</span><span class="asof">2025-08-12 12:00Z</span> · week 2025-W33 · open gapwatch conditions: <span class="m bad">stream:hl.l2book</span><span class="asof">2025-08-12 11:58Z</span></p>
+<p class="warn">If "generated" is older than 30 min, nat2-statuspage.timer is dead (gapwatch alerts on it); every other number below is at least that stale.</p>
+<h2>1. Gate ladder</h2><table><tr><th>gate</th><th>verdict</th><th>entry</th><th>failed checks</th><th>judged against</th></tr><tr><td>feed</td><td><span class="m pass">PASS</span><span class="asof">2025-08-11 13:46Z</span></td><td>seq 2</td><td>—</td><td>—</td></tr><tr><td>map</td><td><span class="m fail">FAIL</span><span class="asof">2025-08-11 16:33Z</span></td><td>seq 3</td><td>-:window</td><td>1</td></tr></table>
+<h3>Pre-registrations</h3><ul><li>seq 1 <code>map_threshold</code> <span class="m ">&gt;= 0.60</span><span class="asof">2025-08-11 12:00Z</span></li></ul>
+<h2>2. Observation series (<code>liq_population</code>, 5 rows)</h2>
+<svg viewBox="0 0 720 180" width="100%" role="img" aria-label="observation series"><line x1="28" y1="152.0" x2="692" y2="152.0" class="grid"/><text x="2" y="156.0" class="tick">0.0</text><line x1="28" y1="90.0" x2="692" y2="90.0" class="grid"/><text x="2" y="94.0" class="tick">0.5</text><line x1="28" y1="28.0" x2="692" y2="28.0" class="grid"/><text x="2" y="32.0" class="tick">1.0</text><polyline points="28.0,52.8 194.0,51.6 360.0,50.3 526.0,49.1 692.0,47.8" fill="none" stroke="#1f77b4" stroke-width="1.5"/><polyline points="28.0,114.8 194.0,114.8 360.0,114.8 526.0,114.8 692.0,114.8" fill="none" stroke="#d62728" stroke-width="1.5"/><polyline points="28.0,145.8 194.0,145.8 360.0,145.8 526.0,145.8 692.0,145.8" fill="none" stroke="#2ca02c" stroke-width="1.5"/><polyline points="28.0,150.8 194.0,150.8 360.0,150.8 526.0,150.8 692.0,150.8" fill="none" stroke="#ff7f0e" stroke-width="1.5"/><text x="28" y="172" class="tick">2025-08-11 19:20Z</text><text x="692" y="172" class="tick" text-anchor="end">2025-08-11 23:20Z</text></svg><p class="legend"><span style="color:#1f77b4">■ notional_frac</span> <span style="color:#d62728">■ mapped_notional_frac</span> <span style="color:#2ca02c">■ wallet_frac</span> <span style="color:#ff7f0e">■ mapped_wallet_frac</span></p><ul><li>notional_frac: <span class="m ">0.840</span><span class="asof">2025-08-11 23:20Z</span></li><li>mapped_notional_frac: <span class="m ">0.300</span><span class="asof">2025-08-11 23:20Z</span></li><li>wallet_frac: <span class="m ">0.050</span><span class="asof">2025-08-11 23:20Z</span></li><li>mapped_wallet_frac: <span class="m ">0.010</span><span class="asof">2025-08-11 23:20Z</span></li></ul>
+<h2>3. Capture &amp; feed health</h2>
+<table><tr><th>stream</th><th>last ingest age</th><th>gap-min this week / budget</th></tr><tr><td>hl.l2book</td><td><span class="m bad">2.5h</span><span class="asof">2025-08-12 09:30Z</span></td><td><span class="m bad">75.0 / 60</span><span class="asof">2025-08-12 11:58Z</span></td></tr><tr><td>hl.trades</td><td><span class="m ">10m</span><span class="asof">2025-08-12 11:50Z</span></td><td><span class="m ">2.5 / 60</span><span class="asof">2025-08-12 11:58Z</span></td></tr></table>
+<h3>Units (recorded by gapwatch)</h3><ul><li>nat-ingestor.service: <span class="m ">active</span><span class="asof">2025-08-12 11:58Z</span></li><li>nat2-capture.service: <span class="m ">active</span><span class="asof">2025-08-12 11:58Z</span></li><li>nat2-cycle.service: <span class="m bad">inactive</span><span class="asof">2025-08-12 11:58Z</span></li><li>nat2-statuspage.timer: <span class="m ">active</span><span class="asof">2025-08-12 11:58Z</span></li></ul>
+<h2>4. nat health</h2><ul>
+<li>newest feature parquet: <span class="m ">3m</span><span class="asof">2025-08-12 11:56Z</span></li>
+<li>last experiment result: <span class="m ">2025-07-30</span><span class="asof">2025-08-12 12:00Z</span></li>
+<li>results this month: <span class="m bad">0</span><span class="asof">2025-08-12 12:00Z</span> (B4 cadence)</li>
+</ul>
+<h2>5. Event log</h2><ul>
+<li>newest event record: <span class="m ">5m</span><span class="asof">2025-08-12 11:55Z</span></li>
+</ul>
+<p class="legend">read-only · no scripts · regenerated every 10 min by nat2-statuspage.timer</p>

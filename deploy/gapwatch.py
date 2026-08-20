@@ -42,7 +42,10 @@ CADENCE_S = {
     "nat2.liqmap": 3600.0,
 }
 GAP_FACTOR = 2.0
-UNITS = ("nat2-capture.service", "nat2-cycle.service")
+UNITS = ("nat2-capture.service", "nat2-cycle.service", "nat2-statuspage.timer")
+# Recorded into the state JSON for the status page (TASK_2/06 reads files only,
+# never queries systemd itself) but not alerted on: nat has its own watchdog.
+REPORT_UNITS = ("nat-ingestor.service", "nat2-evlog.timer", "nat2-gapwatch.timer")
 DISK_MIN_FREE_GB = 20.0
 OBS_SILENCE_S = 7200.0  # 2x the 1 h liquidation-scan cadence
 WEEK_BUDGET_MIN = 60.0  # REDUCED_SPECS §7.2: gap-minutes/week per stream
@@ -103,7 +106,10 @@ def conditions(now_s: float) -> dict[str, tuple[bool, str]]:
         age = now_s - ages.get(stream, 0.0)
         conds[f"stream:{stream}"] = (age > GAP_FACTOR * cadence, f"age {age / 60:.0f}m")
     for unit in UNITS:
-        conds[f"unit:{unit}"] = (not unit_active(unit), "inactive")
+        active = unit_active(unit)
+        conds[f"unit:{unit}"] = (not active, "active" if active else "inactive")
+    for unit in REPORT_UNITS:
+        conds[f"report:{unit}"] = (False, "inactive" if not unit_active(unit) else "active")
     free_gb = shutil.disk_usage(ROOT).free / 1e9
     conds["disk"] = (free_gb < DISK_MIN_FREE_GB, f"{free_gb:.0f}GB free")
     obs = last_observation_s()
@@ -176,7 +182,13 @@ def save_state(state: dict) -> None:
 def cmd_check() -> None:
     now_s = time.time()
     state = load_state()
-    events = tick(state, conditions(now_s), now_s)
+    conds = conditions(now_s)
+    state["units"] = {
+        name.split(":", 1)[1]: detail
+        for name, (_, detail) in conds.items()
+        if name.startswith(("unit:", "report:"))
+    }
+    events = tick(state, {k: v for k, v in conds.items() if not k.startswith("report:")}, now_s)
     # A failed send (DNS blip, ntfy outage) must not lose the alert: queue it
     # in state and retry next tick. Bounded so a long offline stretch can't
     # grow the state file without limit.

@@ -281,6 +281,166 @@ def population_overlap(
     return result
 
 
+@dataclass
+class ClusterScore:
+    """Did liquidations land where the map said mass was, whoever owned it?
+
+    Per-position scoring asks "did *this wallet* blow up at the price we
+    computed for it", and it cannot accumulate: `replace_positions` keeps only
+    the present, so a wallet that has been liquidated is no longer in the table
+    to be matched, and `snapshot_ts` advances past every event on each sweep.
+    Measured over 28 readings, `mapped_notional_frac` was 0.0 every time --
+    which was the measurement's shape, not the market's.
+
+    The cluster claim is weaker and answerable: the map said mass sat at these
+    prices, and forced flow either arrived there or it did not. Ownership never
+    enters, so nothing has to survive in a mutable table for the score to
+    count.
+
+    Baselines are part of the result, not an afterthought. `side_hit_rate` is
+    against a coin flip, because a map that calls the denser side right half
+    the time has told you nothing.
+    """
+
+    events: int = 0
+    scored: int = 0
+    no_map: int = 0           # no snapshot for that coin at all
+    pre_map: int = 0          # liquidation predates the first snapshot -- unpredicted
+    stale_map: int = 0        # newest map older than the bands can survive
+    outside_span: int = 0     # beyond the widest band, where the map claimed nothing
+    side_hits: int = 0        # landed on the side the map marked denser
+    band_hits: int = 0        # landed in a band that actually carried mass
+    distances: list[float] = None
+
+    def __post_init__(self):
+        if self.distances is None:
+            self.distances = []
+
+    def _ratio(self, part: int, whole: int) -> float:
+        return part / whole if whole else 0.0
+
+    @property
+    def side_hit_rate(self) -> float:
+        return self._ratio(self.side_hits, self.scored)
+
+    @property
+    def band_hit_rate(self) -> float:
+        return self._ratio(self.band_hits, self.scored)
+
+    @property
+    def median_distance(self) -> float:
+        if not self.distances:
+            return 0.0
+        ordered = sorted(self.distances)
+        return ordered[len(ordered) // 2]
+
+    @property
+    def stderr(self) -> float:
+        """Standard error of the side hit rate under the coin-flip null."""
+        return (0.25 / self.scored) ** 0.5 if self.scored else 0.0
+
+    @property
+    def z(self) -> float:
+        """Standard errors from a coin flip, signed.
+
+        Reported because a rate without its precision invites the same mistake
+        as a rate without its baseline: 42.8% over 208 events is about two
+        standard errors from chance, which is suggestive and not decisive, and
+        the number alone does not say so.
+        """
+        return (self.side_hit_rate - 0.5) / self.stderr if self.stderr else 0.0
+
+    def summary(self) -> dict:
+        return {
+            "events": self.events,
+            "scored": self.scored,
+            "side_hit_rate": self.side_hit_rate,
+            "band_hit_rate": self.band_hit_rate,
+            "side_baseline": 0.5,
+            "stderr": self.stderr,
+            "z": self.z,
+            "no_map": self.no_map,
+            "pre_map": self.pre_map,
+            "stale_map": self.stale_map,
+            "outside_span": self.outside_span,
+            "median_distance": self.median_distance,
+        }
+
+
+def _band_for(distance: float, bands) -> float | None:
+    """The tightest band containing `distance`, or None if beyond them all."""
+    for band in sorted(bands):
+        if distance <= band:
+            return band
+    return None
+
+
+MAX_MAP_AGE_NS = 5 * 60 * 1_000_000_000
+
+
+def score_clusters(
+    events,
+    rows_by_coin: dict[str, list[dict]],
+    bands=(0.005, 0.01, 0.02, 0.05),
+    min_notional: float = 0.0,
+    max_age_ns: int = MAX_MAP_AGE_NS,
+) -> ClusterScore:
+    """Score liquidations against the map *as it was believed before each one*.
+
+    `rows_by_coin` holds persisted map snapshots per coin, arrival ordered.
+    Each event is matched to the last snapshot that had arrived **strictly
+    before** it -- never the one after, which is the map that already knows.
+
+    **Age is part of the claim.** The tightest band is 0.5% wide, and a two
+    minute old mark on a low-cap alt is already further out than that: measured
+    2026-08-09, CASHCAT and PUMP moved a median +1.7% and +0.7% between
+    snapshot and liquidation, against +0.06% for ARB. Scoring against a stale
+    mark measures elapsed price movement and calls it a prediction, so a map
+    older than `max_age_ns` is set aside and counted rather than used.
+    """
+    from nat2.io.mapsnap import as_of
+
+    result = ClusterScore()
+    for event in events:
+        result.events += 1
+        rows = rows_by_coin.get(event.coin)
+        if not rows:
+            result.no_map += 1
+            continue
+        # Strictly before: a snapshot taken at the same nanosecond as the
+        # liquidation may already contain its consequences.
+        snap = as_of(rows, event.t_event - 1)
+        if snap is None:
+            result.pre_map += 1
+            continue
+        mark = snap.get("mark") or 0.0
+        if mark <= 0:
+            result.no_map += 1
+            continue
+        if max_age_ns and event.t_event - snap["t_ingest"] > max_age_ns:
+            result.stale_map += 1
+            continue
+
+        offset = event.mark_px / mark - 1
+        band = _band_for(abs(offset), bands)
+        if band is None:
+            result.outside_span += 1
+            continue
+
+        key = str(band)
+        up = float((snap.get("up") or {}).get(key) or 0.0)
+        down = float((snap.get("down") or {}).get(key) or 0.0)
+        here, there = (up, down) if offset >= 0 else (down, up)
+
+        result.scored += 1
+        result.distances.append(abs(offset))
+        if here > min_notional:
+            result.band_hits += 1
+        if here > there:
+            result.side_hits += 1
+    return result
+
+
 def method_notional(events) -> dict[str, float]:
     """Liquidated notional split by method.
 

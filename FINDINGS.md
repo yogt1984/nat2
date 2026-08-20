@@ -84,6 +84,57 @@ liquidated wallet no longer holds the position, so a snapshot taken afterwards
 had nothing to predict. Separating "different populations" from "we looked too
 late" needs the snapshot-then-observe cycle, not more analysis.
 
+## Cascades, and the first look at whether fading one pays
+
+**A wider observer set finds 6.5× more liquidations.** *(2026-08-13)* 200 observers,
+53 productive, yielded **1,289 events** spanning 2024-08-11 → 2026-08-13, $26.3M
+of notional. Median event is **$2,000**; p90 is $38,346. The observer count is
+the binding constraint on census size, not the registry.
+
+**Cascades are rare and power-law distributed.** Bucketed into one-minute
+windows: **52 windows ≥ $25k, 12 ≥ $100k, 3 ≥ $1M.** The single largest is
+$13.2M across 305 events (2026-08-10 17:00).
+
+**The largest cascades are in instruments the design excludes.** That $13.2M
+window is `xyz:BRENTOIL`, a builder-deployed perp, and builder-deployed names
+dominate the event count (BRENTOIL 309, CBRS 91, CXMT 44) against BTC 190 and
+ETH 181. `DESIGN.md` excludes builder-deployed perps by default. That exclusion
+may be discarding exactly the venue's most cascade-prone instruments, and it is
+now an open question rather than a settled default.
+
+**One backstop liquidation, out of 1,288.** The first non-`market` method
+observed. Even the $3.8M ETH minute was absorbed by the book unaided — so the
+liquidity to take the other side of forced flow is already there, and whoever
+supplies it is doing so passively.
+
+**First reversion measurement: the fade does not clear cost.** *(2026-08-13)*
+Windows ≥ $100k, builder-deployed excluded, signed against the forced flow so
+positive means the fade wins:
+
+| horizon | median | mean | wins | n |
+|---|---|---|---|---|
+| +5m | +2.4 bps | −0.1 | 2/3 | 3 |
+| +15m | −2.2 bps | +4.5 | 2/5 | 5 |
+| +60m | −0.3 bps | −9.5 | 2/5 | 5 |
+
+Against a measured ~11 bps round trip, **nothing clears**. The two material ETH
+cascades were both preceded by declines and continued down afterwards (−48 and
+−72 bps at 15m and 60m on the larger); the snapback the magnet thesis predicts
+is not visible in them.
+
+*This is n = 5 and settles nothing.* It is recorded because it is the first
+evidence in either direction, and because it points *away* from the branch that
+had the better mechanism story. Two known weaknesses: the direction is proxied
+by the pre-event return because liquidation side is not persisted, and three of
+eight qualifying windows were unreachable because their candles had expired.
+
+**Venue history caps, confirmed.** *(2026-08-13)* ~5000 bars per interval, as
+the sibling project measured independently: **1m reaches 3.6 days**, 5m 17.5,
+15m 52.2, 1h 208.4. So a cascade's minute structure is unrecoverable after
+~3.5 days and any cascade older than ~7 months is invisible at any resolution.
+This is what makes running capture urgent rather than merely important — the
+data is not delayed, it is deleted.
+
 ## Liquidation mathematics
 
 **Our derivation does not reproduce HL's published `liquidationPx`.**
@@ -132,6 +183,58 @@ capture and +395 ms in the next. Negative means HL's timestamp is *ahead* of
 our receipt clock — the condition that voids the `t_ingest` guarantee. Well
 inside the 2 s tolerance, but a ~600 ms shift over minutes is unexplained: NTP
 discipline or HL timestamp semantics.
+
+## Modelling
+
+**The Stage A label degenerates: the race never runs.** *(2026-08-09, BTC)*
+Positive rate **0.7%** over 291 labelled rows at a 2h horizon, 0.0% at 30m. The
+cause is not a coding error but a mismatch the design never addressed: mapped
+clusters sit ~0.7–1% from the mark, while BTC one-minute realized vol is ~1.3bp,
+so a two-hour window offers roughly 14bp of travel against a 70bp target. That
+is a five-sigma move, so virtually every outcome is a **timeout**, which the
+binary label records as 0 — indistinguishable from "the opposite barrier won".
+
+**Fixed 2026-08-11.** Timeouts are excluded rather than recorded as misses --
+the race never finished, so it is not a negative answer -- and targets are
+gated on reachability (`max_reach_sigma`), so a cluster the horizon cannot
+traverse is never raced. Positive rate went from **0.7% to 51.8%**; the race
+now runs. Of 2,885 BTC rows at a 2h horizon: 1,603 out of reach, 168 timeout,
+762 labelled.
+
+**And the fixed label finds nothing.** magnet_a log loss 0.7099 against a
+baseline of 0.7017 and a constant-predictor floor of 0.6885 -- worse than both.
+It does not beat its baseline and does not clear the floor.
+
+The three options as originally written:
+
+- Pick the horizon per row from the distance, so `sqrt(h)·sigma ≈ distance`.
+- Restrict targets to clusters within a few sigma of what the horizon allows.
+- Separate timeout from opposite-barrier in the label rather than collapsing
+  both to 0, so the degenerate case is visible in the data instead of inferred
+  from a base rate.
+
+Related and confirmed working: at a 6h horizon the purge removes every training
+row and the evaluation reports **0 folds** rather than producing a result from
+what is left. Ten hours of tape cannot support a six-hour label.
+
+**The map does not call the side.** *(2026-08-10, first answerable run)*
+`gate map` predictive, scored against the snapshot that predated each event:
+**side hit rate 42.8% over 208 liquidations, against a 50% coin flip.** Median
+distance from the mark 0.31%. Set aside: 127 with no map for that coin, 86
+predating the first snapshot, 253 with a map staler than five minutes.
+
+Below chance, not merely unimpressive. On this sample the claim "forced flow
+arrives on the side where the map put the mass" is not supported.
+
+*A correction that matters more than the number.* An earlier version of this
+check scored whether a liquidation landed within 1% of the nearest mapped
+cluster price, and reported **82.1% against a 20% chance rate, lift 4.11x** —
+which passed the gate. That measurement was close to tautological: clusters are
+built from wallets' liquidation prices, so liquidations occur near them almost
+by construction, and the "chance" model of a uniform price over ±10% was not
+the right null. The side-based test with a coin-flip baseline replaced it and
+reverses the verdict. The flattering number was mine; the sceptical replacement
+was already in the repo.
 
 ## Unexplained
 

@@ -184,7 +184,7 @@ so protection survives process death.
 ```
 nat2 capture hl [--all]            nat2 backfill --from …      nat2 compact
 nat2 registry sync | reconcile     nat2 audit feed | causal
-nat2 map show BTC [--live]         nat2 wallets scan | rank | persist
+nat2 map BTC [--rank]              nat2 wallets scan | rank | persist
 nat2 gate feed | map | magnet | persistence | decay
 nat2 spec freeze | verify | list   nat2 features build   nat2 label build
 nat2 train expert X                nat2 eval expert X    nat2 meta run

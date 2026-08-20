@@ -307,80 +307,80 @@ def test_positions_ts_is_the_maps_epoch(tmp_path):
     assert registry.positions_ts() > 0
 
 
-# --- gate integration ------------------------------------------------------
+# --- gate integration -------------------------------------------------------
 
-def _gate(tmp_path, events, positions, **kw):
+BANDS = (0.005, 0.01, 0.02, 0.05)
+
+
+def _snap(t_ingest: int, mark: float = 100.0, up=None, down=None, coin="BTC") -> dict:
+    up, down = up or {}, down or {}
+    return {"t_ingest": t_ingest, "coin": coin, "mark": mark,
+            "up": {str(b): up.get(b, 0.0) for b in BANDS},
+            "down": {str(b): down.get(b, 0.0) for b in BANDS}}
+
+
+def _gate(tmp_path, events, positions, series=None, **kw):
     from nat2.features.liqmap import build
 
     registry = Registry(tmp_path / "r.sqlite")
     registry.replace_positions([(p, "published") for p in positions])
-    snapshot_ts = registry.positions_ts()
-    registry.record_liquidations(
-        [_event(tid=i, t_event=snapshot_ts + 1, **e) for i, e in enumerate(events, start=1)]
-    )
+    registry.record_liquidations(events)
     liqmap = build(registry.positions("BTC"), "BTC", 100.0, oi_notional=1.0)
-    verdict, checks = gate_map.run(registry, [liqmap], Ledger(tmp_path / "l.jsonl"), **kw)
+    verdict, checks = gate_map.run(
+        registry, [liqmap], Ledger(tmp_path / "l.jsonl"), map_series=series or {}, **kw
+    )
     return verdict, {c.name: c for c in checks}
 
 
 def test_gate_rejects_a_perfect_but_tiny_sample(tmp_path):
     # Three lucky hits is not a validated map.
-    positions = [_position(address=f"0xv{i}", liquidation_px=100.0) for i in range(3)]
-    events = [{"liquidated_user": f"0xv{i}", "mark_px": 100.0} for i in range(3)]
-    _verdict, checks = _gate(tmp_path, events, positions, min_events=30)
+    events = [_event(tid=i, t_event=50, mark_px=99.7) for i in range(3)]
+    series = {"BTC": [_snap(1, down={0.005: 1e6})]}
+    _verdict, checks = _gate(tmp_path, events, [_position(liquidation_px=95.0)],
+                             series=series, min_events=30)
     assert not checks["predictive"].passed
     assert "insufficient history" in checks["predictive"].detail
 
 
-def test_gate_rejects_a_large_sample_with_a_poor_hit_rate(tmp_path):
-    positions = [_position(address=f"0xv{i}", liquidation_px=100.0) for i in range(40)]
-    events = [{"liquidated_user": f"0xv{i}", "mark_px": 100.0 if i < 10 else 200.0}
+def test_gate_rejects_a_side_hit_rate_no_better_than_a_coin_flip(tmp_path):
+    # Mass below; half the flow arrives above. A map that calls the denser side
+    # right half the time has told you nothing.
+    events = [_event(tid=i, t_event=50 + i, mark_px=99.7 if i % 2 else 100.3)
               for i in range(40)]
-    _verdict, checks = _gate(tmp_path, events, positions, min_events=30, min_hit_rate=0.6)
+    series = {"BTC": [_snap(1, down={0.005: 1e6}, up={0.005: 1.0})]}
+    _verdict, checks = _gate(tmp_path, events, [_position(liquidation_px=95.0)],
+                             series=series, min_events=30)
     assert not checks["predictive"].passed
-    assert checks["predictive"].stats["hit_rate"] == pytest.approx(0.25)
+    assert checks["predictive"].stats["side_hit_rate"] == pytest.approx(0.5)
 
 
-def test_gate_passes_predictive_on_enough_accurate_events(tmp_path):
-    positions = [_position(address=f"0xv{i}", liquidation_px=100.0) for i in range(40)]
-    events = [{"liquidated_user": f"0xv{i}", "mark_px": 100.0} for i in range(40)]
-    _verdict, checks = _gate(tmp_path, events, positions, min_events=30, min_hit_rate=0.6)
+def test_gate_passes_predictive_when_the_map_calls_the_side(tmp_path):
+    events = [_event(tid=i, t_event=50 + i, mark_px=99.7) for i in range(40)]
+    series = {"BTC": [_snap(1, down={0.005: 1e6}, up={0.005: 1.0})]}
+    _verdict, checks = _gate(tmp_path, events, [_position(liquidation_px=95.0)],
+                             series=series, min_events=30)
     assert checks["predictive"].passed
+    assert checks["predictive"].stats["side_baseline"] == 0.5
 
 
-def test_gate_predictive_fails_without_any_snapshot(tmp_path):
-    registry = Registry(tmp_path / "r.sqlite")
-    registry.record_liquidations([_event(tid=1)])
-    verdict, checks = gate_map.run(registry, [], Ledger(tmp_path / "l.jsonl"))
-    names = {c.name: c for c in checks}
-    assert not names["predictive"].passed
-    assert "nothing was predicted" in names["predictive"].detail
-    assert not verdict.passed
+def test_gate_predictive_fails_without_any_map_history(tmp_path):
+    events = [_event(tid=i, t_event=50 + i) for i in range(40)]
+    _verdict, checks = _gate(tmp_path, events, [_position(liquidation_px=95.0)])
+    assert not checks["predictive"].passed
+    assert checks["predictive"].stats["no_map"] == 40
 
 
 def test_gate_records_the_predictive_summary_to_the_ledger(tmp_path):
-    positions = [_position(address="0xv0", liquidation_px=100.0)]
-    _verdict, _checks = _gate(tmp_path, [{"liquidated_user": "0xv0", "mark_px": 100.0}],
-                              positions)
-    ledger = Ledger(tmp_path / "l.jsonl")
-    entry = ledger.latest("gate", gate="map")
+    _gate(tmp_path, [_event(tid=1, t_event=50, mark_px=99.7)],
+          [_position(liquidation_px=95.0)],
+          series={"BTC": [_snap(1, down={0.005: 1e6})]})
+    entry = Ledger(tmp_path / "l.jsonl").latest("gate", gate="map")
     assert entry.payload["detail"]["predictive"]["scored"] == 1
-    assert ledger.verify()[0]
+    assert Ledger(tmp_path / "l.jsonl").verify()[0]
 
 
-def test_gate_does_not_credit_liquidations_that_predate_the_map(tmp_path):
-    from nat2.features.liqmap import build
-
+def test_gate_map_fails_without_a_snapshot(tmp_path):
     registry = Registry(tmp_path / "r.sqlite")
-    registry.replace_positions([(_position(address="0xv0", liquidation_px=100.0), "published")])
-    snapshot_ts = registry.positions_ts()
-    # 40 perfect "hits" -- all of which happened before the map was made.
-    registry.record_liquidations([
-        _event(tid=i, t_event=snapshot_ts - 1, liquidated_user="0xv0", mark_px=100.0)
-        for i in range(1, 41)
-    ])
-    liqmap = build(registry.positions("BTC"), "BTC", 100.0, oi_notional=1.0)
-    _verdict, checks = gate_map.run(registry, [liqmap], Ledger(tmp_path / "l.jsonl"))
-    predictive = {c.name: c for c in checks}["predictive"]
-    assert not predictive.passed
-    assert predictive.stats["pre_snapshot"] == 40 and predictive.stats["scored"] == 0
+    verdict, checks = gate_map.run(registry, [], Ledger(tmp_path / "l.jsonl"))
+    assert not verdict.passed
+    assert not {c.name: c for c in checks}["positions_fresh"].passed

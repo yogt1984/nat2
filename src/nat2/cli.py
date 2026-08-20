@@ -286,19 +286,54 @@ REGISTRY = HOME / "data/registry.sqlite"
 RegistryOpt = Annotated[Path, typer.Option("--registry", help="wallet registry database")]
 
 
-async def _marks_and_oi(testnet: bool = False) -> tuple[dict, dict]:
-    """Mark price and OI notional per coin, from one request."""
+async def _contexts(testnet: bool = False) -> tuple[dict, dict, dict]:
+    """Mark, OI notional and 24h volume per coin, from one request."""
     info = InfoClient(_budget(), testnet=testnet)
     meta, ctxs = await info.meta_and_asset_ctxs()
     await info.aclose()
-    marks, oi = {}, {}
+    marks, oi, volume = {}, {}, {}
     for asset, ctx in zip(meta["universe"], ctxs):
         mark = float(ctx.get("markPx") or 0)
         if not mark:
             continue
-        marks[asset["name"]] = mark
-        oi[asset["name"]] = float(ctx.get("openInterest") or 0) * mark
+        name = asset["name"]
+        marks[name] = mark
+        oi[name] = float(ctx.get("openInterest") or 0) * mark
+        volume[name] = float(ctx.get("dayNtlVlm") or 0)
+    return marks, oi, volume
+
+
+async def _marks_and_oi(testnet: bool = False) -> tuple[dict, dict]:
+    marks, oi, _ = await _contexts(testnet)
     return marks, oi
+
+
+async def _daily_sigma(coin: str, days: int = 7, testnet: bool = False) -> tuple[float | None, int]:
+    """Realized daily volatility from hourly candles, and the candle count.
+
+    Measured rather than assumed: sigma sets the displacement a cascade
+    produces, so a guessed value quietly sets the answer. Returns None when HL
+    returned too little history to say -- a fabricated sigma is worse than an
+    absent one.
+    """
+    import time
+
+    end_ms = int(time.time() * 1000)
+    start_ms = end_ms - days * 24 * 3600 * 1000
+    info = InfoClient(_budget(), testnet=testnet)
+    try:
+        rows = await info.candles(coin, "1h", start_ms, end_ms)
+    finally:
+        await info.aclose()
+    closes = [float(r["c"]) for r in rows or [] if float(r.get("c") or 0) > 0]
+    if len(closes) < 25:
+        return None, len(closes)
+    import math as _math
+
+    returns = [_math.log(b / a) for a, b in zip(closes, closes[1:])]
+    mean = sum(returns) / len(returns)
+    variance = sum((r - mean) ** 2 for r in returns) / (len(returns) - 1)
+    return _math.sqrt(variance) * _math.sqrt(24), len(closes)
 
 
 @wallets_app.command("seed")
@@ -626,6 +661,165 @@ def _cell(value, fmt: str) -> str:
     return "-" if value is None else fmt.format(value)
 
 
+@app.command("eval")
+def eval_expert(
+    coin: str,
+    horizon: Annotated[str, typer.Option(help="label horizon, e.g. 30m, 4h")] = "1h",
+    interval: Annotated[str, typer.Option(help="bar width")] = "1m",
+    splits: Annotated[int, typer.Option(help="walk-forward folds")] = 5,
+    min_rows: Annotated[int, typer.Option(help="minimum labelled rows to fit")] = 200,
+    k: Annotated[float, typer.Option("--k", help="barrier half-width, in sigma over the horizon")] = 1.0,
+    include_timeouts: Annotated[bool, typer.Option("--include-timeouts",
+        help="count an unfinished race as a miss")] = False,
+    placebo: Annotated[int, typer.Option(help="permutation replications; 0 to skip")] = 0,
+    seed: Annotated[int, typer.Option(help="placebo seed")] = 0,
+    root: RootOpt = RAW,
+    registry: RegistryOpt = REGISTRY,
+) -> None:
+    """Score an expert against its baseline, purged walk-forward, net of costs."""
+    from nat2.core.costs import Costs
+    from nat2.core.registry import Registry
+    from nat2.experts.magnet_a import MagnetA, build_dataset
+    from nat2.features.bars import bars, iter_prints, path
+    from nat2.features.context import by_coin, iter_contexts
+    from nat2.features.frame import build as build_frame
+    from nat2.io.mapsnap import STREAM, series
+    from nat2.io.worm import read_records
+    from nat2.validate.evaluate import evaluate
+
+    name = coin.upper()
+    horizon_ns = parse_window(horizon)
+    prints = iter_prints(read_records(root, "hl.trades"))
+    built = bars(prints, parse_window(interval), coin=name)
+    if not built:
+        console.print(f"[red]no captured prints for {name}[/red]")
+        raise typer.Exit(1)
+
+    contexts = by_coin(iter_contexts(read_records(root, "hl.assetctxs"))).get(name, [])
+    maps = series(read_records(root, STREAM), name)
+    events = [e for e in Registry(registry).liquidations() if e.coin == name]
+    rows, stats = build_frame(built, contexts, maps, liquidations=events, coin=name)
+
+    expert = MagnetA(horizon_ns=horizon_ns, min_rows=min_rows)
+    _PATHS[name] = path(prints, name)
+    data, labels = build_dataset(
+        rows, {name: _PATHS[name]}, horizon_ns, expert.features,
+        bar_ns=parse_window(interval), k=k, include_timeouts=include_timeouts,
+    )
+    console.print(
+        f"frame {stats.rows} rows (map {stats.map_frac:.0%}) -> "
+        f"{len(data)} labelled, positive rate {data.positive_rate:.1%}"
+    )
+    console.print(
+        f"[dim]dropped: {labels.no_sigma} no sigma, "
+        f"{labels.unresolved} unresolved, {labels.timeouts} timeout"
+        + ("" if include_timeouts else " (excluded)") + "[/dim]"
+    )
+    if not len(data):
+        console.print(
+            "[yellow]nothing labelled[/yellow] -- the magnet features need map "
+            "snapshots, which only start accumulating once `nat2 cycle` runs"
+        )
+        raise typer.Exit(1)
+
+    result = evaluate(expert, data, horizon_ns, Costs(), n_splits=splits)
+    verdict = result.verdict()
+
+    table = Table(title=f"{name} eval — {horizon} horizon, k={k:g}σ, {splits} folds")
+    for col in ("", "n", "base rate", "log loss", "brier", "decisions", "hit rate"):
+        table.add_column(col, justify="right")
+    for side in ("expert", "baseline"):
+        row = verdict[side]
+        table.add_row(
+            row["name"], str(row["n"]), f"{row['base_rate']:.1%}",
+            f"{row['log_loss']:.4f}", f"{row['brier']:.4f}",
+            str(row["decision_n"]),
+            "-" if row["decision_hit_rate"] is None else f"{row['decision_hit_rate']:.1%}",
+        )
+    console.print(table)
+    console.print(
+        f"folds {verdict['folds']['folds']} · tested {verdict['folds']['tested_frac']:.0%} · "
+        f"purged {verdict['folds']['purged']} · skipped {verdict['skipped_folds']} · "
+        f"leaked {verdict['leaked']}"
+    )
+    console.print(
+        f"costs {verdict['costs']['round_trip_bps']:.1f}bp round trip "
+        f"(hash {verdict['costs']['hash']}) · threshold {verdict['threshold']:.3f}"
+    )
+    console.print(
+        f"log-loss delta {verdict['delta']:+.4f} (z {verdict['delta_z']:+.2f}, "
+        f"need {verdict['min_delta_z']:+.1f}) · constant floor "
+        f"{verdict['constant_log_loss']:.4f} "
+        + ("[green]cleared[/green]" if verdict["beats_constant"]
+           else "[red]NOT cleared[/red]")
+    )
+    if placebo:
+        _run_placebo(
+            placebo, seed, rows, built, contexts, maps, events, name,
+            expert, horizon_ns, parse_window(interval), k, include_timeouts,
+            splits, result.delta_z,
+        )
+
+    if result.beats_baseline:
+        console.print("[bold green]beats its baseline[/bold green] out of sample")
+    else:
+        console.print(
+            "[bold red]does not beat its baseline[/bold red] -- "
+            "the machinery is not earning its keep, so it does not enter the pool"
+        )
+    raise typer.Exit(0 if result.beats_baseline else 1)
+
+
+def _run_placebo(replications, seed, rows, built, contexts, maps, events, coin,
+                 expert, horizon_ns, bar_ns, k, include_timeouts, splits, real_z):
+    """Re-run the pipeline with map masses shuffled across their own locations.
+
+    Labels are invariant -- barriers are placed from volatility alone -- so only
+    the features are rebuilt. Anything that survives was geometry, which is the
+    confound `HYPOTHESIS_1.md` §5 exists to remove.
+    """
+    from nat2.core.costs import Costs
+    from nat2.experts.magnet_a import MagnetA, build_dataset
+    from nat2.features.bars import path
+    from nat2.features.frame import build as build_frame
+    from nat2.validate.evaluate import evaluate
+    from nat2.validate.placebo import PlaceboResult, permute_series
+
+    zs = []
+    console.print(f"[dim]placebo: {replications} replication(s) …[/dim]")
+    for i in range(replications):
+        shuffled = permute_series({coin: maps}, seed + i)[coin]
+        fake_rows, _ = build_frame(built, contexts, shuffled, liquidations=events, coin=coin)
+        fake_data, _ = build_dataset(
+            fake_rows, {coin: _PATHS[coin]}, horizon_ns, expert.features,
+            bar_ns=bar_ns, k=k, include_timeouts=include_timeouts,
+        )
+        if not len(fake_data):
+            continue
+        fake = evaluate(MagnetA(horizon_ns=horizon_ns, min_rows=expert.min_rows),
+                        fake_data, horizon_ns, Costs(), n_splits=splits)
+        zs.append(fake.delta_z)
+
+    outcome = PlaceboResult(real_z=real_z, placebo_z=zs)
+    summary = outcome.summary()
+    console.print(
+        f"placebo z: mean {summary['mean_placebo_z']:+.2f}, max "
+        f"{summary['max_placebo_z']:+.2f} over {summary['replications']} run(s) · "
+        f"{summary['exceeded']} matched or beat the real {real_z:+.2f} · "
+        f"p {summary['p_value']:.3f}"
+    )
+    if outcome.collapses():
+        console.print("[green]effect collapses under permutation[/green] — mass, not geometry")
+    else:
+        console.print(
+            "[bold red]effect survives permutation[/bold red] — indistinguishable "
+            "from geometry, which is the null, not the hypothesis"
+        )
+
+
+_PATHS: dict = {}
+
+
 @app.command("cycle")
 def cycle(
     snapshot_every: Annotated[str, typer.Option(help="registry sweep interval")] = "6h",
@@ -683,16 +877,20 @@ def cycle(
 def map_show(
     coin: str,
     registry: RegistryOpt = REGISTRY,
-    buckets: Annotated[int, typer.Option(help="rows to display each side")] = 16,
+    buckets: Annotated[int, typer.Option(help="max rows to display each side")] = 12,
+    min_share: Annotated[float, typer.Option(help="hide buckets under this %% of mapped notional")] = 1.0,
     resolution: Annotated[float, typer.Option(help="bucket width, percent")] = 0.125,
     span: Annotated[float, typer.Option(help="how far from mark to look, percent")] = 10.0,
+    rank: Annotated[bool, typer.Option("--rank", help="score which cluster is worth pushing into")] = False,
+    cost: Annotated[float, typer.Option(help="--rank: round-trip cost, relative")] = 0.001,
+    sigma: Annotated[float, typer.Option(help="--rank: daily vol; 0 measures it from candles")] = 0.0,
 ) -> None:
     """Liquidation map for one coin, with the coverage number that qualifies it."""
     from nat2.core.registry import Registry
     from nat2.features.liqmap import OI_SIDES, build
 
     async def _run() -> None:
-        marks, oi = await _marks_and_oi()
+        marks, oi, volume = await _contexts()
         if coin not in marks:
             console.print(f"[red]{coin} is not a listed perp[/red]")
             raise typer.Exit(1)
@@ -705,7 +903,18 @@ def map_show(
             console.print(f"[red]no registry positions in {coin}[/red] -- snapshot first")
             raise typer.Exit(1)
 
-        rows = [b for b in liqmap.buckets if b.notional > 0]
+        # Filter by mass, not by adjacency. Showing the nearest buckets fills
+        # the screen with noise and pushes the clusters that actually carry the
+        # notional off the bottom -- on BTC the two largest were nearly cut
+        # while 81 near-empty buckets were being considered for display.
+        # Relative to what is actually ON the map, not to total mapped
+        # notional: most positions sit beyond the span and are in no bucket at
+        # all, so a floor taken from the total emptied the table entirely for
+        # every coin except BTC.
+        in_span = sum(b.notional for b in liqmap.buckets)
+        floor = in_span * min_share / 100.0
+        rows = [b for b in liqmap.buckets if b.notional > floor]
+        hidden_mass = sum(b.notional for b in liqmap.buckets if 0 < b.notional <= floor)
         above = [b for b in rows if b.low >= liqmap.mark][:buckets]
         below = [b for b in rows if b.high < liqmap.mark][-buckets:]
         peak = max((b.notional for b in above + below), default=1.0)
@@ -724,7 +933,7 @@ def map_show(
         console.print(table)
 
         bands = ", ".join(f"{b:.1%} imb {liqmap.imbalance(b):+.2f}" for b in sorted(liqmap.up))
-        shown = sum(1 for b in above) + sum(1 for b in below)
+        shown = len(above) + len(below)
         console.print(
             f"coverage [bold]{liqmap.coverage:.1%}[/bold] of venue position notional "
             f"(OI x{OI_SIDES:g}) · {liqmap.positions} positions "
@@ -734,12 +943,87 @@ def map_show(
         hidden = len(rows) - shown
         if hidden > 0:
             console.print(
-                f"[yellow]{hidden} more bucket(s) not shown[/yellow] -- raise --buckets; "
-                "the bars are scaled to the largest bucket displayed, not the largest one"
+                f"[yellow]{hidden} cluster(s) over the floor not shown[/yellow] -- "
+                "raise --buckets; bars scale to the largest bucket displayed"
+            )
+        if hidden_mass > 0:
+            console.print(
+                f"[dim]below the {min_share:g}% floor: ${hidden_mass / 1e6:,.1f}M "
+                f"({hidden_mass / liqmap.total_notional:.0%} of mapped notional), "
+                "spread thin[/dim]"
             )
         console.print(f"{bands}")
+        if rank:
+            await _print_rank(positions, coin, marks[coin], volume.get(coin, 0.0), cost, sigma)
 
     asyncio.run(_run())
+
+
+async def _print_rank(
+    positions, coin: str, mark: float, day_volume: float, cost: float, sigma: float
+) -> None:
+    """Which cluster is worth pushing into -- the map ranks nothing by itself.
+
+    The tallest bar is rarely the answer: walk cost grows linearly in distance
+    while a cascade's displacement grows as the square root of mass, so a
+    smaller near cluster routinely outranks a larger far one.
+    """
+    from nat2.features.attack import DEFAULT_KAPPA, DEFAULT_OMEGA_CROSS, signal
+
+    measured = 0
+    if sigma <= 0:
+        sigma, measured = await _daily_sigma(coin)
+        if sigma is None:
+            console.print(
+                f"[yellow]cannot rank[/yellow]: HL returned {measured} hourly candle(s), "
+                "too few to measure volatility -- pass --sigma to assert one"
+            )
+            return
+    if day_volume <= 0:
+        console.print("[yellow]cannot rank[/yellow]: no 24h volume for this coin")
+        return
+
+    result = signal(positions, coin, mark, sigma, day_volume, cost, hinge=False)
+    if result is None:
+        console.print("[yellow]cannot rank[/yellow]: inputs missing")
+        return
+
+    table = Table(title=f"{coin} — which cluster is worth pushing into")
+    for col in ("side", "psi", "conc", "d*", "mass", "n", ""):
+        table.add_column(col, justify="right")
+    for name, reach in (("up", result.up), ("down", result.down)):
+        distance = f"{reach.distance:+.2%}" if reach.distance is not None else "--"
+        verdict = "[green]viable[/green]" if reach.viable else ""
+        table.add_row(
+            name,
+            f"{reach.psi:.3f}",
+            f"{reach.concentration:.0%}",
+            distance,
+            f"${reach.mass / 1e6:,.1f}M",
+            str(reach.positions),
+            verdict,
+        )
+    console.print(table)
+
+    if result.abstain:
+        console.print(
+            "[yellow]fuel on both sides[/yellow] -- a volatility state, not a direction"
+        )
+    worst = max(result.up.concentration, result.down.concentration)
+    if worst >= 0.9:
+        console.print(
+            f"[yellow]{worst:.0%} of a reading rests on one position[/yellow] -- "
+            "a supremum is brittle, and this one is a single wallet"
+        )
+    console.print(
+        f"[dim]sigma {sigma:.2%}/day ({'measured, ' + str(measured) + ' candles' if measured else 'asserted'}), "
+        f"volume ${day_volume / 1e6:,.0f}M/day, cost {cost:.2%} round trip, "
+        f"kappa {DEFAULT_KAPPA:g}, omega_cross {DEFAULT_OMEGA_CROSS:g}[/dim]"
+    )
+    console.print(
+        "[dim]psi > 1 means a push into that side pays for itself. Unfitted: A = 1 and the "
+        "cost is asserted, so the level is not yet a claim -- the ordering is.[/dim]"
+    )
 
 
 def _map_row(table, bucket, mark: float, peak: float) -> None:
@@ -763,6 +1047,8 @@ def gate_map(
     from nat2.core.registry import Registry
     from nat2.features.liqmap import build
     from nat2.gates import map as gate
+    from nat2.io.mapsnap import STREAM, iter_snapshots
+    from nat2.io.worm import read_records
 
     async def _run() -> None:
         marks, oi = await _marks_and_oi()
@@ -772,7 +1058,12 @@ def gate_map(
             for c in (x.strip() for x in coins.split(","))
             if c in marks
         ]
-        verdict, checks = gate.run(reg, maps, Ledger(ledger), min_coverage=min_coverage)
+        history: dict[str, list[dict]] = {}
+        for row in iter_snapshots(read_records(RAW, STREAM)):
+            history.setdefault(row["coin"], []).append(row)
+        verdict, checks = gate.run(
+            reg, maps, Ledger(ledger), min_coverage=min_coverage, map_series=history
+        )
         table = Table(title="gate map")
         for col in ("", "coin", "check", "detail"):
             table.add_column(col, overflow="fold")

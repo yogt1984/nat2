@@ -11,6 +11,8 @@ dependencies = [
     "typer>=0.15",
     "rich>=13.9",
     "polars>=1.0",
+    "lightgbm>=4.0",
+    "scikit-learn>=1.5",
 ]
 
 [project.optional-dependencies]

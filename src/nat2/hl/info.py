@@ -63,6 +63,18 @@ class InfoClient:
     async def clearinghouse_state(self, address: str) -> dict:
         return await self.post("clearinghouseState", user=address)
 
+    async def candles(self, coin: str, interval: str, start_ms: int, end_ms: int) -> list:
+        """Historical candles. Used to measure volatility rather than assume it.
+
+        HL caps history per interval, so a request for more than it retains
+        returns what it has -- the caller checks the count rather than trusting
+        the window it asked for.
+        """
+        return await self.post(
+            "candleSnapshot",
+            req={"coin": coin, "interval": interval, "startTime": start_ms, "endTime": end_ms},
+        )
+
     async def universe(self, min_day_volume: float = 0.0) -> list[str]:
         """Tradable perp names, newest universe, delisted assets dropped.
 

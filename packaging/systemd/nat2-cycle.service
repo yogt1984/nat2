@@ -1,0 +1,24 @@
+[Unit]
+Description=nat2 cycle — snapshot the registry, then observe liquidations
+Documentation=file:///home/onat/nat2/TASKS.md
+After=network-online.target nat2-capture.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/onat/nat2
+Environment=NAT2_HOME=/home/onat/nat2
+
+# No --wallet-limit. A partial sweep silently shrinks the map: replace_positions
+# rewrites only what was swept, so a limit drops coverage with no error at all
+# (observed 31.5%% -> 11.7%% after a 400-wallet pass). The whole registry or
+# nothing.
+ExecStart=/home/onat/.local/bin/nat2 cycle --snapshot-every 6h --scan-every 1h
+
+# Last-run times persist in SQLite, so a restart does not re-trigger the
+# expensive sweep and a job never overlaps itself.
+Restart=always
+RestartSec=60
+
+[Install]
+WantedBy=default.target

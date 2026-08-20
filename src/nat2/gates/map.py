@@ -21,7 +21,7 @@ from nat2.core.guard import Verdict, record
 from nat2.core.registry import Registry
 from nat2.features.liqmap import OI_SIDES, LiqMap
 from nat2.features.liqmath import validate
-from nat2.features.liquidations import score
+from nat2.features.liquidations import score_clusters
 from nat2.ledger.chain import Ledger
 from nat2.validate.audit_feed import Check
 
@@ -31,8 +31,9 @@ MAX_POSITION_AGE_NS = 6 * 3600 * NS
 # A map that got three liquidations right is not a validated map. The sample
 # floor is what stops a lucky handful from clearing the gate.
 MIN_SCORED_LIQUIDATIONS = 30
-MIN_HIT_RATE = 0.60
-PRICE_TOLERANCE = 0.01
+# Against a coin flip, not against zero: a map that calls the denser side right
+# half the time has told you nothing, so the bar is how far above 0.5 it gets.
+MIN_SIDE_HIT_RATE = 0.60
 # The derivation is a maintenance approximation, not the primary source, so a
 # poor score does not fail the gate on its own -- but a *collapse* means HL's
 # margin rules moved and the fill-maintained map is drifting blind.
@@ -44,9 +45,9 @@ def run(
     maps: list[LiqMap],
     ledger: Ledger,
     min_coverage: float = MIN_COVERAGE,
-    tolerance: float = PRICE_TOLERANCE,
     min_events: int = MIN_SCORED_LIQUIDATIONS,
-    min_hit_rate: float = MIN_HIT_RATE,
+    min_side_hit_rate: float = MIN_SIDE_HIT_RATE,
+    map_series: dict[str, list[dict]] | None = None,
 ) -> tuple[Verdict, list[Check]]:
     checks: list[Check] = []
 
@@ -91,29 +92,31 @@ def run(
         )
     )
 
-    scored = score(
-        registry.liquidations(), registry.positions(), snapshot_ts or 0, tolerance
-    )
+    # Scored against the map that PREDATED each liquidation, from persisted
+    # snapshot history -- not against the current sweep. Using the latest
+    # positions made every event "predate the map" and the gate unpassable
+    # however much data accumulated.
+    scored = score_clusters(registry.liquidations(), map_series or {})
     detail_text = (
-        f"{scored.hits}/{scored.scored} liquidations within {tolerance:.1%} of the mapped "
-        f"price (median err {scored.median_error:.2%}); "
-        f"{scored.unmatched} unmapped wallet(s), {scored.pre_snapshot} predate the map"
+        f"side {scored.side_hit_rate:.1%} vs coin flip 50% "
+        f"(need {min_side_hit_rate:.0%}, z {scored.z:+.1f}), "
+        f"band {scored.band_hit_rate:.1%}, "
+        f"median distance {scored.median_distance:.2%}, over {scored.scored} scored; "
+        f"set aside: {scored.no_map} no map, {scored.pre_map} predate it, "
+        f"{scored.stale_map} stale, {scored.outside_span} beyond the bands"
     )
-    if snapshot_ts is None:
-        detail_text = "no position snapshot, so nothing was predicted"
-    elif scored.scored < min_events:
+    if scored.scored < min_events:
         detail_text = (
-            f"insufficient history: {scored.scored} scored liquidation(s), need "
-            f"{min_events}. {scored.unmatched} unmapped, {scored.pre_snapshot} predate the "
-            "map. Capture must accumulate liquidations that happened AFTER a snapshot."
+            f"insufficient history: {scored.scored} scored of {scored.events} "
+            f"liquidation(s), need {min_events}. {scored.no_map} no map, "
+            f"{scored.pre_map} predate it, {scored.stale_map} stale, "
+            f"{scored.outside_span} beyond the bands."
         )
     checks.append(
         Check(
             "predictive",
             "-",
-            snapshot_ts is not None
-            and scored.scored >= min_events
-            and scored.hit_rate >= min_hit_rate,
+            scored.scored >= min_events and scored.side_hit_rate >= min_side_hit_rate,
             detail_text,
             scored.summary(),
         )

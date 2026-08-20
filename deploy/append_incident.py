@@ -27,7 +27,7 @@ entry = ledger.append(
         "from_ts": FROM_TS,
         "to_ts": now_ns(),
         "cause": "unsupervised process death (pre-systemd); confirmed not deliberate",
-        "action": "capture+cycle moved under systemd --user units (deploy/systemd_units.py)",
+        "action": "capture+cycle moved under systemd --user units (packaging/systemd/, installed by deploy/systemd_units.py)",
     },
 )
 print(f"appended incident as seq {entry.seq}")

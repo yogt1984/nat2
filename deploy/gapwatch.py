@@ -188,7 +188,7 @@ def cmd_check() -> None:
         for name, (_, detail) in conds.items()
         if name.startswith(("unit:", "report:"))
     }
-    events = tick(state, conds, now_s)
+    events = tick(state, {k: v for k, v in conds.items() if not k.startswith("report:")}, now_s)
     # A failed send (DNS blip, ntfy outage) must not lose the alert: queue it
     # in state and retry next tick. Bounded so a long offline stretch can't
     # grow the state file without limit.

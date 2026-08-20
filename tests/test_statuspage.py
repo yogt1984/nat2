@@ -109,3 +109,16 @@ def test_write_atomic(tmp_path):
     target = tmp_path / "www" / "status.html"
     sp.write_atomic(target, "<p>x</p>")
     assert target.read_text() == "<p>x</p>" and not target.with_suffix(".tmp").exists()
+
+
+def test_malformed_ledger_lines_are_skipped(tmp_path):
+    ledger = tmp_path / "ledger.jsonl"
+    ledger.write_text("\n".join([
+        "not json", "[1,2]", json.dumps({"kind": "gate", "payload": None}),  # no ts
+        json.dumps({"seq": 1, "ts": int(NOW * NS), "kind": "gate", "payload": {"gate": "x", "passed": True, "detail": None}}),
+        json.dumps({"seq": 2, "ts": int(NOW * NS), "kind": "observation", "payload": "string"}),
+    ]) + "\n")
+    paths = sp.Paths(**{f: tmp_path / f for f in sp.Paths.__dataclass_fields__ if f != "ledger"}, ledger=ledger)
+    out = sp.render(sp.collect(NOW, paths))
+    assert "<td>x</td>" in out and "PASS" in out
+    assert out.count('class="m ') == out.count('class="asof"')

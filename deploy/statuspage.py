@@ -80,7 +80,11 @@ def read_ledger(path: Path) -> tuple[dict, dict, list]:
             e = json.loads(line)
         except json.JSONDecodeError:
             continue
-        kind, p = e.get("kind"), e.get("payload", {})
+        if not isinstance(e, dict) or "ts" not in e:
+            continue
+        kind, p = e.get("kind"), e.get("payload") or {}
+        if not isinstance(p, dict):
+            continue
         if kind == "gate":
             gates[p.get("gate", "?")] = e
         elif kind == "preregistration":
@@ -113,7 +117,9 @@ def collect(now_s: float, paths: Paths = Paths()) -> dict:
     try:
         gw = json.loads(paths.gapwatch_state.read_text())
         gw_asof = paths.gapwatch_state.stat().st_mtime
-    except (OSError, json.JSONDecodeError):
+        if not isinstance(gw, dict):
+            raise ValueError("state is not an object")
+    except (OSError, ValueError):
         gw, gw_asof = {}, None
     results = sorted(paths.nat_results.glob("result__*.md")) if paths.nat_results.exists() else []
     last_result = results[-1].name.split("__")[1] if results else None
@@ -173,10 +179,11 @@ def render(d: dict) -> str:
     rows: list[str] = []
     # 1. gate ladder
     for name, e in sorted(d["gates"].items()):
-        p = e["payload"]
+        p = e.get("payload") or {}
+        detail = p.get("detail") or {}
         verdict = "PASS" if p.get("passed") else "FAIL"
-        failed = ", ".join(p.get("detail", {}).get("failed", [])) or "—"
-        cites = p.get("detail", {}).get("judged_against", [])
+        failed = ", ".join(map(str, detail.get("failed") or [])) or "—"
+        cites = detail.get("judged_against") or []
         rows.append(f"<tr><td>{html.escape(name)}</td><td>{metric(verdict, _iso(e['ts'] / 1e9), verdict.lower())}"
                     f"</td><td>seq {e['seq']}</td><td>{html.escape(failed)}</td>"
                     f"<td>{html.escape(', '.join(map(str, cites))) or '—'}</td></tr>")
@@ -184,7 +191,7 @@ def render(d: dict) -> str:
                   "<th>judged against</th></tr>" + "".join(rows) + "</table>")
     pre = "".join(
         f"<li>seq {e['seq']} <code>{html.escape(n)}</code> "
-        f"{metric(_short(e['payload'].get('pass_if') or e['payload'].get('min_scoreable_events', '—')), _iso(e['ts'] / 1e9))}</li>"
+        f"{metric(_short(e['payload'].get('pass_if') or e['payload'].get('min_scoreable_events') or '—'), _iso(e['ts'] / 1e9))}</li>"
         for n, e in sorted(d["prereg"].items(), key=lambda kv: kv[1]["seq"]))
     # 2. observation series
     last_obs = d["obs"][-1] if d["obs"] else None
@@ -194,14 +201,18 @@ def render(d: dict) -> str:
     # 3. capture & feed health
     gw = d["gapwatch"]
     gw_asof = _iso(d["gapwatch_asof"])
-    streams = "".join(
-        f"<tr><td>{html.escape(s)}</td><td>{metric(_age(now, t), _iso(t), 'bad' if now - t > 7200 else '')}</td>"
-        f"<td>{metric(f'{gw.get('gap_minutes', {}).get(f'stream:{s}', 0.0):.1f} / {WEEK_BUDGET_MIN:.0f}', gw_asof, 'bad' if gw.get('gap_minutes', {}).get(f'stream:{s}', 0.0) > WEEK_BUDGET_MIN else '')}</td></tr>"
-        for s, t in sorted(d["stream_ingest"].items()))
+    gap_min = gw.get("gap_minutes", {}) if isinstance(gw.get("gap_minutes"), dict) else {}
+    stream_rows = []
+    for s, t in sorted(d["stream_ingest"].items()):
+        gm = float(gap_min.get(f"stream:{s}", 0.0))
+        stream_rows.append(
+            f"<tr><td>{html.escape(s)}</td><td>{metric(_age(now, t), _iso(t), 'bad' if now - t > 7200 else '')}</td>"
+            f"<td>{metric(f'{gm:.1f} / {WEEK_BUDGET_MIN:.0f}', gw_asof, 'bad' if gm > WEEK_BUDGET_MIN else '')}</td></tr>")
+    streams = "".join(stream_rows)
     units = "".join(
         f"<li>{html.escape(u)}: {metric(st, gw_asof, '' if st == 'active' else 'bad')}</li>"
-        for u, st in sorted(gw.get("units", {}).items())) or '<li class="warn">gapwatch state carries no unit states yet</li>'
-    open_conds = ", ".join(sorted(gw.get("open", {}))) or "none"
+        for u, st in sorted((gw.get("units") or {}).items())) or '<li class="warn">gapwatch state carries no unit states yet</li>'
+    open_conds = ", ".join(sorted(gw.get("open") or {})) or "none"
     # 4. nat health + 5. events
     pq = d["nat_parquet_mtime"]
     ev = d["events_mtime"]

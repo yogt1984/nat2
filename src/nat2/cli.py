@@ -558,6 +558,39 @@ def wallets_replay(
     console.print(f"positions by source: {reg.source_counts()}")
 
 
+@wallets_app.command("reconstruct")
+def wallets_reconstruct(
+    coin: Annotated[str, typer.Option(help="perp coin, e.g. BTC")],
+    start: Annotated[int, typer.Option("--from", help="window start, ns since epoch")],
+    end: Annotated[int, typer.Option("--to", help="window end, ns since epoch")],
+    fills: Annotated[int, typer.Option(help="userFills checkpoints for the N most active unanchored wallets")] = 0,
+    root: RootOpt = RAW,
+    registry: RegistryOpt = REGISTRY,
+    out: Annotated[Path, typer.Option("--out", help="parquet root")] = PARQUET,
+    ledger: LedgerOpt = LEDGER,
+    testnet: bool = False,
+) -> None:
+    """Per-wallet position series from the public tape, with an explicit anchor per wallet.
+
+    Unanchored wallets are flagged, never estimated; a capture gap unanchors all.
+    """
+    from nat2.core.registry import Registry
+    from nat2.io.tape_series import reconstruct
+
+    async def _run() -> dict:
+        info = InfoClient(_budget(), testnet=testnet) if fills else None
+        try:
+            return await reconstruct(root, Registry(registry), coin, start, end, out, info, fills)
+        finally:
+            if info is not None:
+                await info.aclose()
+
+    result = asyncio.run(_run())
+    if result["drift"] and result["drift"]["compared"]:
+        result["drift_seq"] = Ledger(ledger).append("observation", result["drift"]).seq
+    console.print(json.dumps(result, default=str))
+
+
 @app.command("bars")
 def bars_show(
     coin: str,

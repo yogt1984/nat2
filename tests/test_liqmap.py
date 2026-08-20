@@ -110,7 +110,9 @@ def test_gate_map_fails_on_insufficient_history(tmp_path):
     verdict, checks = gate_map.run(registry, [liqmap], Ledger(tmp_path / "l.jsonl"))
     names = {c.name: c for c in checks}
     assert names["coverage"].passed          # tiny OI, so coverage is huge
-    assert not names["predictive"].passed    # no liquidations observed yet
+    # No pre-registration in this ledger, no liquidations: the gate refuses.
+    assert not names["preregistered"].passed
+    assert verdict.detail["verdict"] == "refused"
     assert not verdict.passed, "a gate that cannot be evaluated must not pass"
 
 

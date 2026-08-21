@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from nat2.core.clock import NS
 from nat2.features.bars import Bar
 from nat2.features.context import Context, rolling_z
-from nat2.features.spec import BAND_KEYS, undeclared
+from nat2.features.spec import BAND_KEYS, SHELL_KEYS, undeclared
 
 SIGMA_WINDOW = 30
 SIGMA_REGIME_WINDOW = 120
@@ -153,7 +153,8 @@ def build(
                 "coverage", "published_frac", "imb_0005", "imb_001", "imb_002",
                 "imb_005", "imb_cross_002", "l_up_002", "l_dn_002",
                 "d_near_up_pct", "d_near_dn_pct", "d_near_up", "d_near_dn",
-                "map_age_s")})
+                "map_age_s",
+                *(f"m_up_{s}" for s in SHELL_KEYS), *(f"m_dn_{s}" for s in SHELL_KEYS))})
         else:
             stats.with_map += 1
             row.update(_map_features(snap, t, sigma, row.get("day_volume")))
@@ -206,7 +207,26 @@ def _map_features(snap: dict, t: int, sigma: float | None, day_volume) -> dict:
         "d_near_up": scaled(near.get("up_dist")),
         "d_near_dn": scaled(near.get("down_dist")),
         "map_age_s": (t - snap["t_ingest"]) / NS,
+        **_shells("m_up", up),
+        **_shells("m_dn", down),
     }
+
+
+def _shells(prefix: str, cumulative: dict) -> dict:
+    """Per-shell mass from the persisted cumulative band totals (seq 153 §1.2).
+
+    `m_i = cum[B_i] - cum[B_{i-1}]`, floored at 0 -- the floor matters under
+    the permutation placebo, which shuffles cumulative totals and can leave
+    them non-monotone. A shell whose bounding totals are missing stays `None`.
+    """
+    out, previous = {}, 0.0
+    for key, band in zip(SHELL_KEYS, BAND_KEYS.values()):
+        total = cumulative.get(band)
+        if total is None or previous is None:
+            out[f"{prefix}_{key}"], previous = None, None
+            continue
+        out[f"{prefix}_{key}"], previous = max(0.0, float(total) - previous), float(total)
+    return out
 
 
 def _event_features(events, bar: Bar, index: int, bars: list[Bar]) -> dict:

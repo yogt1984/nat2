@@ -73,6 +73,17 @@ FEATURES: dict[str, FeatureSpec] = {
         _spec("d_near_up", MAP, 30, "d_near_up_pct in units of ONE-BAR sigma"),
         _spec("d_near_dn", MAP, 30, "d_near_dn_pct in units of ONE-BAR sigma"),
         _spec("map_age_s", MAP, 0, "seconds since the map snapshot was taken"),
+        # Shell masses for the alpha kernel (ledger seq 153): raw notional in
+        # the shell (B_{i-1}, B_i] per side, differences of the cumulative
+        # band totals, floored at 0. Point-in-time like every map column.
+        _spec("m_up_0005", MAP, 0, "liquidation notional in the (0, 0.5%] shell above"),
+        _spec("m_up_001", MAP, 0, "liquidation notional in the (0.5%, 1%] shell above"),
+        _spec("m_up_002", MAP, 0, "liquidation notional in the (1%, 2%] shell above"),
+        _spec("m_up_005", MAP, 0, "liquidation notional in the (2%, 5%] shell above"),
+        _spec("m_dn_0005", MAP, 0, "liquidation notional in the (0, 0.5%] shell below"),
+        _spec("m_dn_001", MAP, 0, "liquidation notional in the (0.5%, 1%] shell below"),
+        _spec("m_dn_002", MAP, 0, "liquidation notional in the (1%, 2%] shell below"),
+        _spec("m_dn_005", MAP, 0, "liquidation notional in the (2%, 5%] shell below"),
         # --- events
         _spec("tau", EVENT, 0, "bars since the last observed liquidation in this coin"),
         _spec("liq_flow", EVENT, 30, "liquidated notional over the trailing window"),
@@ -80,6 +91,8 @@ FEATURES: dict[str, FeatureSpec] = {
 }
 
 BAND_KEYS = {"imb_0005": "0.005", "imb_001": "0.01", "imb_002": "0.02", "imb_005": "0.05"}
+# Shell suffixes in band order; `m_up_<s>` / `m_dn_<s>` are the shell masses.
+SHELL_KEYS = ("0005", "001", "002", "005")
 
 
 def declared() -> set[str]:

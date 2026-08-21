@@ -42,6 +42,11 @@ CADENCE_S = {
     "nat2.liqmap": 3600.0,
 }
 GAP_FACTOR = 2.0
+# Intra-file holes: a 33-min capture outage on 2026-08-20 18:21-18:54 sat inside
+# an hourly file that rotated normally, invisible to the manifest. The writer
+# appends to the open .zst every few seconds, so its mtime is a heartbeat.
+TAPE_DIR = ROOT / "data" / "raw" / "hl.trades"
+TAPE_SILENCE_S = 300.0
 UNITS = ("nat2-capture.service", "nat2-cycle.service", "nat2-statuspage.timer")
 # Recorded into the state JSON for the status page (TASK_2/06 reads files only,
 # never queries systemd itself) but not alerted on: nat has its own watchdog.
@@ -72,6 +77,14 @@ def newest_ingest(manifest: Path = MANIFEST) -> dict[str, float]:
         except (json.JSONDecodeError, KeyError, TypeError):
             continue
     return out
+
+
+def tape_heartbeat_s(tape_dir: Path = TAPE_DIR) -> float:
+    """mtime of the newest hl.trades file (open or closed), epoch seconds; 0 if none."""
+    try:
+        return max((f.stat().st_mtime for f in tape_dir.glob("*/*.zst")), default=0.0)
+    except OSError:
+        return 0.0
 
 
 def last_observation_s(ledger: Path = LEDGER) -> float | None:
@@ -105,6 +118,8 @@ def conditions(now_s: float) -> dict[str, tuple[bool, str]]:
     for stream, cadence in CADENCE_S.items():
         age = now_s - ages.get(stream, 0.0)
         conds[f"stream:{stream}"] = (age > GAP_FACTOR * cadence, f"age {age / 60:.0f}m")
+    age = now_s - tape_heartbeat_s(TAPE_DIR)
+    conds["stream:hl.trades:heartbeat"] = (age > TAPE_SILENCE_S, f"open file silent {age / 60:.0f}m")
     for unit in UNITS:
         active = unit_active(unit)
         conds[f"unit:{unit}"] = (not active, "active" if active else "inactive")

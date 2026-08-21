@@ -76,3 +76,24 @@ def test_check_records_unit_states_and_report_units_never_alert(tmp_path, monkey
     assert state["units"]["nat2-statuspage.timer"] == "active"
     assert set(state["units"]) == set(gapwatch.UNITS) | set(gapwatch.REPORT_UNITS)
     assert not any(k.startswith("report:") for k in state["open"])  # report units never open a gap
+
+
+def test_tape_heartbeat_sees_intra_file_silence(tmp_path, monkeypatch):
+    """TASK_2/07 follow-up: a hole inside a normally rotated file must still open a gap."""
+    import os
+    day = tmp_path / "2026-08-20"
+    day.mkdir()
+    f = day / "hl.trades-20260820T17-00.ndjson.zst"
+    f.write_bytes(b"x")
+    os.utime(f, (NOW - 1965, NOW - 1965))
+    assert gapwatch.tape_heartbeat_s(tmp_path) == NOW - 1965
+    assert gapwatch.tape_heartbeat_s(tmp_path / "missing") == 0.0
+    monkeypatch.setattr(gapwatch, "TAPE_DIR", tmp_path)
+    monkeypatch.setattr(gapwatch, "newest_ingest", lambda: {s: NOW for s in gapwatch.CADENCE_S})
+    monkeypatch.setattr(gapwatch, "unit_active", lambda unit: True)
+    monkeypatch.setattr(gapwatch, "last_observation_s", lambda: NOW)
+    monkeypatch.setattr(gapwatch, "EVLOG_STATE", tmp_path / "missing.json")
+    conds = gapwatch.conditions(NOW)
+    assert conds["stream:hl.trades:heartbeat"][0] and not conds["stream:hl.trades"][0]
+    os.utime(f, (NOW - 30, NOW - 30))
+    assert not gapwatch.conditions(NOW)["stream:hl.trades:heartbeat"][0]

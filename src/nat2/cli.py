@@ -1074,7 +1074,7 @@ def gate_magnet(
     root: RootOpt = RAW, registry: RegistryOpt = REGISTRY, ledger: LedgerOpt = LEDGER,
     placebo: Annotated[int, typer.Option(help="permutation replications per cell")] = 200,
 ) -> None:
-    """Run gate `magnet`: cluster pull vs sign(imb), net of costs -- refuses until pre-registered N."""
+    """Run gate `magnet`: cluster pull vs sign(imb) net of costs; refuses until pre-registered N."""
     from nat2.core.registry import Registry
     from nat2.gates import magnet as gate
     from nat2.io.mapsnap import STREAM, iter_snapshots

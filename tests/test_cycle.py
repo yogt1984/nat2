@@ -98,6 +98,9 @@ def _cycle(tmp_path, **kw) -> Cycle:
     config = CycleConfig(
         registry_path=tmp_path / "r.sqlite",
         ledger_path=tmp_path / "l.jsonl",
+        # Never the default `data/raw`: from the repo root that is the live tape, and a
+        # forced cycle would replay all of it (minutes, gigabytes) inside a unit test.
+        raw_root=tmp_path / "raw",
         snapshot_interval_ns=kw.pop("snapshot_ns", 6 * HOUR),
         scan_interval_ns=kw.pop("scan_ns", HOUR),
     )

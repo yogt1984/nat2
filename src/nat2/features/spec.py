@@ -91,5 +91,16 @@ def max_lookback() -> int:
     return max(f.lookback for f in FEATURES.values())
 
 
+def by_source(*sources: str) -> set[str]:
+    """Declared feature names from the given sources.
+
+    The registry's `source` field earns its keep here: an ablation that has to
+    hand-maintain a list of which columns came from the map would drift the
+    moment a feature was added, and drift silently in the direction of a
+    flattering answer.
+    """
+    return {f.name for f in FEATURES.values() if f.source in sources}
+
+
 def undeclared(columns) -> set[str]:
     return set(columns) - declared()

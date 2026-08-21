@@ -26,6 +26,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from nat2.experts.base import ColumnExpert, Dataset, Expert, NotFitted, finite_rows, to_matrix
+from nat2.features.spec import MAP
 from nat2.labels.barriers import race
 
 MIN_TRAIN_ROWS = 200
@@ -141,11 +142,52 @@ class MagnetA(Expert):
         "coverage", "published_frac", "map_age_s",
     ]
 
-    def __init__(self, horizon_ns: int, model_factory=None, min_rows: int = MIN_TRAIN_ROWS):
+    def __init__(self, horizon_ns: int, model_factory=None, min_rows: int = MIN_TRAIN_ROWS,
+                 features: list[str] | None = None, name: str | None = None):
+        from nat2.features.spec import undeclared
+
         self.horizon_ns = horizon_ns
         self.min_rows = min_rows
         self._model_factory = model_factory or default_model
         self._model = None
+        if features is not None:
+            bad = undeclared(features)
+            if bad:
+                # The class-level check already ran; an instance override must
+                # not be a way around it.
+                raise ValueError(f"undeclared feature(s): {sorted(bad)}")
+            if not features:
+                raise ValueError("an expert with no features cannot be fitted")
+            self.features = list(features)
+        if name:
+            self.name = name
+
+    def without_map(self) -> "MagnetA":
+        """The same expert, blind to the liquidation map.
+
+        If this scores as well as the full model, the edge is not coming from
+        the map -- which the permutation placebo cannot distinguish, because it
+        shuffles map mass and leaves every other feature intact.
+        """
+        from nat2.features.spec import by_source
+
+        map_features = by_source(MAP)
+        return MagnetA(
+            self.horizon_ns, self._model_factory, self.min_rows,
+            features=[f for f in self.features if f not in map_features],
+            name=f"{self.name}:no_map",
+        )
+
+    def map_only(self) -> "MagnetA":
+        """Only the map. The complement of `without_map`."""
+        from nat2.features.spec import by_source
+
+        map_features = by_source(MAP)
+        return MagnetA(
+            self.horizon_ns, self._model_factory, self.min_rows,
+            features=[f for f in self.features if f in map_features],
+            name=f"{self.name}:map_only",
+        )
 
     def fit(self, data: Dataset) -> "MagnetA":
         if len(data) < self.min_rows:

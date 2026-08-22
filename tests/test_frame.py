@@ -206,3 +206,36 @@ def test_a_frame_with_no_inputs_at_all_still_produces_rows():
     assert len(rows) == 1
     assert rows[0]["premium"] is None and rows[0]["imb_002"] is None
     assert undeclared(rows[0]) == set()
+
+
+# --- bisect as-of, and rebuilding only the map columns ---------------------------
+
+def test_as_of_bisect_equals_the_linear_walk():
+    import random
+    from nat2.features.frame import _as_of
+    rng = random.Random(5)
+    for _ in range(200):
+        keys = sorted(rng.randint(0, 100) for _ in range(rng.randint(0, 20)))
+        rows = [{"k": k, "i": i} for i, k in enumerate(keys)]
+        t = rng.randint(-5, 105)
+        linear = None
+        for row in rows:
+            if row["k"] > t:
+                break
+            linear = row
+        assert _as_of(rows, t, lambda r: r["k"]) is linear
+
+
+def test_rebuild_map_columns_matches_build_and_nulls_without_a_snapshot():
+    from nat2.features.frame import MAP_COLUMNS, rebuild_map_columns
+    bars = [_bar(i) for i in range(40)]
+    rows, _ = build(bars, [_ctx(0)], [_map(5 * MIN, imb=0.1), _map(20 * MIN, imb=0.7)])
+    other = [_map(5 * MIN, imb=-0.4, up=3000.0, down=1000.0), _map(30 * MIN, imb=0.2)]
+    expect, _ = build(bars, [_ctx(0)], other)
+    got = rebuild_map_columns(rows, other)
+    assert got == expect                                  # map columns from `other`, everything else kept
+    assert got[0]["imb_002"] is None                      # bar 0 closes before the first snapshot
+    assert got[6]["imb_002"] == pytest.approx(-0.4) and got[-1]["imb_002"] == pytest.approx(0.2)
+    none = rebuild_map_columns(rows, [])
+    assert all(r[c] is None for r in none for c in MAP_COLUMNS) and none[0]["close"] == rows[0]["close"]
+

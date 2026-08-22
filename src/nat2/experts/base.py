@@ -48,6 +48,12 @@ class Dataset:
     def positive_rate(self) -> float:
         return (sum(1 for v in self.y if v > 0) / len(self.y)) if self.y else 0.0
 
+    def with_rows(self, rows: list[dict]) -> "Dataset":
+        """The same labels and weights over re-featured rows; row i must still be decision i."""
+        if len(rows) != len(self.rows):
+            raise ValueError(f"{len(rows)} rows for {len(self.rows)} labels")
+        return Dataset(self.columns, to_matrix(rows, self.columns), self.y, self.weight, rows)
+
 
 def to_matrix(rows: list[dict], columns: list[str]) -> list[list[float]]:
     """Rows to a dense matrix, with `None` becoming NaN rather than zero."""

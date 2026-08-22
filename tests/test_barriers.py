@@ -226,3 +226,30 @@ def test_sample_weights_zero_out_unresolved_labels():
     weights = sample_weights(results, [0, 0])
     assert len(weights) == 2
     assert weights[0] > 0 and weights[1] == 0.0
+
+
+# --- the bisect window is the linear window -------------------------------------
+
+def _linear_window(path, t0, horizon_ns):
+    deadline = t0 + horizon_ns
+    for t, price in path:
+        if t <= t0:
+            continue
+        if t > deadline:
+            return
+        yield t, price
+
+
+def test_bisect_window_equals_the_linear_walk_on_random_sorted_paths():
+    import random
+    from nat2.labels.barriers import _window, assert_sorted
+    rng = random.Random(3)
+    for _ in range(200):
+        ts = sorted(rng.randint(0, 500) for _ in range(rng.randint(0, 40)))      # ties included
+        p = [(t, 100.0 + rng.random()) for t in ts]
+        t0, h = rng.randint(-10, 510), rng.randint(0, 200)
+        assert list(_window(p, t0, h)) == list(_linear_window(p, t0, h)), (p, t0, h)
+    assert assert_sorted([(1, 1.0), (1, 2.0), (2, 3.0)]) == [(1, 1.0), (1, 2.0), (2, 3.0)]
+    with pytest.raises(ValueError, match="sorted"):
+        assert_sorted([(2, 1.0), (1, 2.0)])
+

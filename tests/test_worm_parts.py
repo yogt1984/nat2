@@ -66,3 +66,22 @@ def test_a_corrupt_terminated_line_still_raises(tmp_path):
 
     with pytest.raises(json.JSONDecodeError):
         list(read_records(tmp_path, "hl.trades"))
+
+
+def test_an_empty_flush_leaves_the_file_untouched(tmp_path):
+    """A flush with nothing to write must not touch the file: the gapwatch heartbeat is the
+    mtime, and a 9-byte empty frame every 30 s made a silent websocket look alive."""
+    import os
+    import time
+    from nat2.io.worm import WormWriter
+    with WormWriter(tmp_path, "hl.trades") as w:
+        w.write({"x": 1}, t_event=None, t_ingest=1)
+        w.flush()
+        f = next((tmp_path / "hl.trades").glob("*/*.zst"))
+        os.utime(f, (1_000_000, 1_000_000))
+        size = f.stat().st_size
+        w.flush()
+        assert f.stat().st_size == size and f.stat().st_mtime == 1_000_000
+        w.write({"x": 2}, t_event=None, t_ingest=2)
+        w.flush()
+        assert f.stat().st_size > size and f.stat().st_mtime > 1_000_000

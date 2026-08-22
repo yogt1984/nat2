@@ -24,6 +24,7 @@ capture_app = typer.Typer(no_args_is_help=True, help="Capture daemons")
 audit_app = typer.Typer(no_args_is_help=True, help="Data integrity audits")
 gate_app = typer.Typer(no_args_is_help=True, help="Falsification gates")
 log_app = typer.Typer(no_args_is_help=True, help="Hash-chained ledger")
+tape_app = typer.Typer(no_args_is_help=True, help="Tape-to-tape checks")
 wallets_app = typer.Typer(no_args_is_help=True, help="Wallet registry")
 liq_app = typer.Typer(no_args_is_help=True, help="Realized liquidations")
 app.add_typer(wallets_app, name="wallets")
@@ -32,6 +33,7 @@ app.add_typer(capture_app, name="capture")
 app.add_typer(audit_app, name="audit")
 app.add_typer(gate_app, name="gate")
 app.add_typer(log_app, name="log")
+app.add_typer(tape_app, name="tape")
 
 console = Console()
 
@@ -1146,6 +1148,29 @@ def log_query(
             f"[dim]{entry.seq:>4} {entry.ts / NS:.0f}[/dim] {entry.kind} "
             f"{json.dumps(entry.payload)[:160]}"
         )
+
+
+@tape_app.command("compare")
+def tape_compare(
+    other: Annotated[Path, typer.Option("--other", help="the other tape's data/raw root")],
+    tolerance: Annotated[float, typer.Option(help="relative record-count difference tolerated per hour")] = 0.0,
+    root: RootOpt = RAW,
+) -> None:
+    """Compare two tapes hour by hour from their manifests; exit 1 on any differing hour."""
+    from nat2.io.tape import compare
+
+    results = compare(root, other, tolerance)
+    table = Table(title=f"tape compare  ours={root}  theirs={other}")
+    for col in ("stream", "overlapping hours", "same", "differ", "only ours", "only theirs"):
+        table.add_column(col, justify="right")
+    for c in results:
+        table.add_row(c.stream, str(c.overlapping), str(c.same), str(len(c.differ)),
+                      str(len(c.only_ours)), str(len(c.only_theirs)))
+    console.print(table)
+    for c in results:
+        for hour, ours, theirs in c.differ[:20]:
+            console.print(f"  [yellow]{c.stream} {hour}[/yellow]: ours {ours} theirs {theirs} ({theirs - ours:+d})")
+    raise typer.Exit(1 if any(c.differ for c in results) else 0)
 
 
 OPERATOR_KINDS = ("preregistration", "incident")

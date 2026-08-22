@@ -47,6 +47,12 @@ GAP_FACTOR = 2.0
 # appends to the open .zst every few seconds, so its mtime is a heartbeat.
 TAPE_DIR = ROOT / "data" / "raw" / "hl.trades"
 TAPE_SILENCE_S = 300.0
+# A reboot silences this watchdog with the capture; at its first tick afterwards the open file
+# is fresh again and no edge opens (the 55-min hole of 2026-08-21 was booked as 14). So a tick
+# this late measures the hole itself: last write before the capture unit's restart, to the restart.
+TICK_S = 300.0
+WATCHDOG_DOWN_FACTOR = 3.0
+NAT2 = ROOT / ".venv" / "bin" / "nat2"   # the ledger is written through the CLI, never from here
 UNITS = ("nat2-capture.service", "nat2-cycle.service", "nat2-statuspage.timer")
 # Recorded into the state JSON for the status page (TASK_2/06 reads files only,
 # never queries systemd itself) but not alerted on: nat has its own watchdog.
@@ -96,6 +102,45 @@ def last_observation_s(ledger: Path = LEDGER) -> float | None:
         except (json.JSONDecodeError, KeyError):
             continue
     return None
+
+
+def unit_active_since_s(unit: str) -> float | None:
+    """Epoch seconds at which `unit` last became active; None if unknown or inactive."""
+    try:
+        mono = subprocess.run(["systemctl", "--user", "show", "-p", "ActiveEnterTimestampMonotonic",
+                               "--value", unit], capture_output=True, text=True, timeout=10).stdout.strip()
+        boot = time.time() - float(Path("/proc/uptime").read_text().split()[0])
+        return boot + int(mono) / 1e6 if mono.isdigit() and int(mono) else None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def capture_hole(state: dict, now_s: float, tape_dir: Path = TAPE_DIR, unit: str = UNITS[0]):
+    """(start_s, end_s) of the tape hole around a capture restart that this watchdog slept
+    through; None when the watchdog was on time, the capture did not restart, or no hole."""
+    last = state.get("last_tick")
+    if last is None or now_s - last < WATCHDOG_DOWN_FACTOR * TICK_S:
+        return None
+    restart = unit_active_since_s(unit)
+    if restart is None or restart < last:
+        return None
+    before = [f.stat().st_mtime for f in tape_dir.glob("*/*.zst") if f.stat().st_mtime < restart]
+    if not before:
+        return None
+    # The newest file's mtime is its last write (a crashed part) or its close (a sealed part, up to
+    # a rotation late); when the manifest's last record sits within a tick of it, that is exact.
+    sealed = newest_ingest().get("hl.trades", 0.0)
+    start = sealed if sealed and 0 <= max(before) - sealed < TICK_S else max(before)
+    return (start, restart) if restart - start > TAPE_SILENCE_S else None
+
+
+def ledger_incident(payload: dict) -> bool:
+    """Append an incident through the CLI; False when the venv is unavailable (retried next tick)."""
+    try:
+        return subprocess.run([str(NAT2), "log", "add", "--kind", "incident", "--json", json.dumps(payload)],
+                              capture_output=True, timeout=60).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
 
 
 def unit_active(unit: str) -> bool:
@@ -203,7 +248,21 @@ def cmd_check() -> None:
         for name, (_, detail) in conds.items()
         if name.startswith(("unit:", "report:"))
     }
+    hole = capture_hole(state, now_s)
     events = tick(state, {k: v for k, v in conds.items() if not k.startswith("report:")}, now_s)
+    if hole:
+        start, end = hole
+        minutes = (end - start) / 60
+        span = " -> ".join(datetime.fromtimestamp(s, timezone.utc).strftime("%m-%d %H:%M:%SZ") for s in hole)
+        gaps = state.setdefault("gap_minutes", {})
+        gaps["stream:hl.trades:hole"] = gaps.get("stream:hl.trades:hole", 0.0) + minutes
+        state["holes"] = (state.get("holes") or [])[-19:] + [{"from_s": start, "to_s": end, "minutes": minutes}]
+        events.append(("open", f"CAPTURE HOLE {minutes:.0f}m ({span}): capture restarted while this watchdog "
+                               f"was silent; `nat2 audit feed` has the exact gap"))
+        state.setdefault("pending_incidents", []).append({
+            "name": "capture_hole", "from_ts": int(start * 1e9), "to_ts": int(end * 1e9), "minutes": minutes,
+            "cause": "capture unit restarted during watchdog silence (reboot or stop); tape mtimes + manifest"})
+    state["pending_incidents"] = [p for p in state.get("pending_incidents", []) if not ledger_incident(p)][-20:]
     # A failed send (DNS blip, ntfy outage) must not lose the alert: queue it
     # in state and retry next tick. Bounded so a long offline stretch can't
     # grow the state file without limit.

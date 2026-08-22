@@ -192,3 +192,17 @@ def test_intervals_come_from_the_window_parser(window, expected_h):
     from nat2.core.clock import parse_window
 
     assert parse_window(window) == pytest.approx(expected_h * HOUR)
+
+
+def test_every_job_that_ran_is_an_action_in_the_cycle_home(tmp_path):
+    """TASK_2/13: L1 for a job that ran, L0 for one that failed -- next to this cycle's data home."""
+    from nat2.io import actions
+    cycle = _cycle(tmp_path)
+
+    async def boom():
+        raise RuntimeError("HL said no")
+
+    cycle._run_snapshot = boom
+    asyncio.run(cycle.run_once(force=True))
+    by_kind = {r["kind"]: r["level"] for r in actions.read(tmp_path)}
+    assert by_kind["cycle:snapshot"] == "L0" and by_kind["cycle:scan"] == "L1"

@@ -25,6 +25,7 @@ audit_app = typer.Typer(no_args_is_help=True, help="Data integrity audits")
 gate_app = typer.Typer(no_args_is_help=True, help="Falsification gates")
 log_app = typer.Typer(no_args_is_help=True, help="Hash-chained ledger")
 tape_app = typer.Typer(no_args_is_help=True, help="Tape-to-tape checks")
+roster_app = typer.Typer(no_args_is_help=True, help="Pair roster (pairs.toml), ledgered on change")
 wallets_app = typer.Typer(no_args_is_help=True, help="Wallet registry")
 liq_app = typer.Typer(no_args_is_help=True, help="Realized liquidations")
 app.add_typer(wallets_app, name="wallets")
@@ -34,6 +35,7 @@ app.add_typer(audit_app, name="audit")
 app.add_typer(gate_app, name="gate")
 app.add_typer(log_app, name="log")
 app.add_typer(tape_app, name="tape")
+app.add_typer(roster_app, name="roster")
 
 console = Console()
 
@@ -120,6 +122,7 @@ def _streams(spec: str) -> list[str]:
 def capture_hl(
     coins: Annotated[str, typer.Option("--coins", help="comma-separated, or --all")] = "BTC,ETH",
     all_coins: Annotated[bool, typer.Option("--all", help="every non-delisted perp")] = False,
+    roster: Annotated[bool, typer.Option("--roster", help="the A+B roster of pairs.toml (live volumes)")] = False,
     min_volume: Annotated[float, typer.Option(help="--all: min 24h notional volume")] = 0.0,
     streams: StreamsOpt = DEFAULT_STREAMS,
     root: RootOpt = RAW,
@@ -136,9 +139,12 @@ def capture_hl(
 
     async def _run() -> None:
         selected = [c.strip() for c in coins.split(",") if c.strip()]
-        if all_coins:
+        if all_coins or roster:
             info = InfoClient(_budget(), testnet=testnet)
-            selected = await info.universe(min_day_volume=min_volume)
+            if roster:
+                selected = list(_live_roster(info, await info.meta_and_asset_ctxs()).captured)
+            else:
+                selected = await info.universe(min_day_volume=min_volume)
             await info.aclose()
         config = CaptureConfig(
             root=root,
@@ -1150,6 +1156,70 @@ def log_query(
         )
 
 
+def _live_roster(info, meta_and_ctxs):
+    """The roster against the venue's live cross-section; coverage from the latest map verdict."""
+    from nat2.core.roster import RosterSpec, evaluate
+
+    meta, ctxs = meta_and_ctxs
+    volumes = {a["name"]: float(c.get("dayNtlVlm", 0) or 0)
+               for a, c in zip(meta.get("universe", []), ctxs) if not a.get("isDelisted")}
+    coverage = (latest_verdict(Ledger(LEDGER), "map") or Verdict("map", False, {}, 0)).detail.get("coverage", {})
+    return evaluate(RosterSpec.load(HOME / "pairs.toml"), volumes, coverage)
+
+
+@roster_app.command("show")
+def roster_show(root: RootOpt = RAW, ledger: LedgerOpt = LEDGER) -> None:
+    """Evaluate pairs.toml against the tape's latest cross-section; print roster and diff."""
+    _roster(root, ledger, write=False)
+
+
+@roster_app.command("apply")
+def roster_apply(root: RootOpt = RAW, ledger: LedgerOpt = LEDGER) -> None:
+    """Evaluate; only if the roster changed, append a `roster` ledger entry and an L1 action."""
+    _roster(root, ledger, write=True)
+
+
+def _roster(root: Path, ledger: Path, write: bool) -> None:
+    from nat2.core.clock import NS, now_ns
+    from nat2.core.roster import KIND, RosterSpec, apply, diff, evaluate
+    from nat2.features.context import iter_contexts, latest
+    from nat2.io.actions import append
+    from nat2.io.worm import read_records
+
+    contexts = latest(iter_contexts(read_records(root, "hl.assetctxs", since_ns=now_ns() - 3 * 3600 * NS)))
+    if not contexts:
+        console.print("[red]no captured asset contexts in the last 3h; refusing to evaluate a roster[/red]")
+        raise typer.Exit(1)
+    chain = Ledger(ledger)
+    coverage = (latest_verdict(chain, "map") or Verdict("map", False, {}, 0)).detail.get("coverage", {})
+    result = evaluate(RosterSpec.load(HOME / "pairs.toml"), {c: ctx.day_volume for c, ctx in contexts.items()}, coverage)
+    console.print(f"observed ({len(result.observed)}): {', '.join(result.observed)}")
+    console.print(f"b-roster ({len(result.b_roster)}): {', '.join(result.b_roster) or '-'}")
+    console.print(f"map universe ({len(result.map_universe)}): {', '.join(result.map_universe) or '-'}")
+    changes = diff(chain.latest(KIND, name=KIND), result)
+    console.print(f"changes vs ledger: {json.dumps(changes) if changes else 'none'}")
+    if write and changes:
+        entry, _ = apply(chain, result)
+        append("L1", "roster", {"seq": entry.seq, "changes": changes}, root=HOME)
+        console.print(f"appended roster as seq {entry.seq}")
+
+
+@app.command("actions")
+def actions_list(
+    since: Annotated[str, typer.Option(help="window, e.g. 24h, 7d")] = "24h",
+    level: Annotated[str | None, typer.Option(help="L0 ops, L1 observation, L2 research, L3 signal")] = None,
+) -> None:
+    """List the action log -- what the system did, by level -- for the last window."""
+    from nat2.core.clock import now_ns
+    from nat2.io.actions import read
+
+    rows = read(HOME, since_ns=now_ns() - parse_window(since), level=level)
+    for r in rows:
+        console.print(f"{to_dt(r['t_ingest']).strftime('%m-%d %H:%M:%S')}  {r['level']}  {r['kind']:14s} "
+                      f"{json.dumps(r['payload'], default=str)[:120]}")
+    console.print(f"[dim]{len(rows)} action(s) in the last {since}" + (f" at {level}" if level else "") + "[/dim]")
+
+
 @tape_app.command("compare")
 def tape_compare(
     other: Annotated[Path, typer.Option("--other", help="the other tape's data/raw root")],
@@ -1190,6 +1260,8 @@ def log_add(
     if not isinstance(body, dict):
         raise typer.BadParameter("--json must be a JSON object")
     entry = Ledger(ledger).append(kind, body)
+    from nat2.io.actions import append as action
+    action("L2", f"log:{kind}", {"seq": entry.seq, "name": body.get("name")}, root=Path(ledger).parent.parent)
     console.print(f"appended seq {entry.seq} kind={kind} name={body.get('name', '-')}")
 
 

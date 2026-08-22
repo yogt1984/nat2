@@ -187,6 +187,25 @@ discipline or HL timestamp semantics.
 
 ## Modelling
 
+**The map's imbalance changes sign with how far you look.** *(2026-08-22)* The first
+wide (±30 %) build of the BTC map, from the same registry positions the shipped map
+uses: mass above the mark is $31.5M within 1 %, $67.9M within 5 %, $353.1M within 30 %;
+below it is $0.1M, $44.7M, $332.7M. The resulting imbalance runs **−0.995 at 1 %, −0.949
+at 2 %, −0.206 at 5 %, +0.272 at 10 %, +0.009 at 20 %, −0.030 at 30 %** — the sign flips
+between the 5 % band the shipped map can see and the 10 % band it cannot. Since the
+predicted direction *is* the sign of the imbalance, "which way does the magnet pull"
+has no answer independent of the band, and the pre-registered 1h/4h cells (σ√T ≈ 0.5–1 %)
+and a weekly cell (σ√T ≈ 8 %) are therefore reading different objects, not the same
+object at different horizons.
+
+**Most of the mapped mass is outside the shipped map.** *(2026-08-22)* Within ±30 %,
+$573.1M of BTC liquidation notional sits beyond ±5 % — against $112.6M inside it, so the
+persisted v1 snapshot addresses about 16 % of the mass it could. The single largest
+bucket is **$96.4M at −9 %**, invisible to every feature shipped today. A further 235
+positions lie beyond ±30 % even in the wide build. Recorded when `nat2.liqmap2` was
+built (TASK_2/17); v2 costs 2.2× v1 on disk (0.1 MB/day) because empty buckets are not
+stored, so the width was never the thing that was expensive.
+
 **The Stage A label degenerates: the race never runs.** *(2026-08-09, BTC)*
 Positive rate **0.7%** over 291 labelled rows at a 2h horizon, 0.0% at 30m. The
 cause is not a coding error but a mismatch the design never addressed: mapped

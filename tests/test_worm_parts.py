@@ -85,3 +85,21 @@ def test_an_empty_flush_leaves_the_file_untouched(tmp_path):
         w.write({"x": 2}, t_event=None, t_ingest=2)
         w.flush()
         assert f.stat().st_size > size and f.stat().st_mtime > 1_000_000
+
+
+def test_since_skips_parts_that_ended_before_it_and_yields_the_same_records(tmp_path):
+    """TASK_2/14 read-side: `since_ns` must not decompress the whole tape; output is unchanged."""
+    from nat2.io.worm import _file_end_ns
+    H = 3600 * 1_000_000_000
+    t0 = 1_787_320_800_000_000_000                      # 2026-08-21T14:00:00Z, an hour boundary
+    with WormWriter(tmp_path, "hl.trades") as w:
+        for i, t in enumerate((t0 - H + 5, t0 - 1, t0 + 7, t0 + H + 9)):   # hours 13, 13, 14, 15
+            w.write({"i": i}, t_event=None, t_ingest=t)
+    parts = sorted((tmp_path / "hl.trades").glob("*/*.zst"))
+    assert [p.name.rsplit("-", 2)[-2] for p in parts] == ["20260821T13", "20260821T14", "20260821T15"]
+    assert _file_end_ns(parts[0]) == t0 and _file_end_ns(tmp_path / "weird.ndjson.zst") == 1 << 63
+    everything = [r["payload"]["i"] for r in read_records(tmp_path, "hl.trades")]
+    assert everything == [0, 1, 2, 3]
+    assert [r["payload"]["i"] for r in read_records(tmp_path, "hl.trades", since_ns=t0)] == [2, 3]
+    assert [r["payload"]["i"] for r in read_records(tmp_path, "hl.trades", since_ns=t0 - 1)] == [1, 2, 3]
+    assert [r["payload"]["i"] for r in read_records(tmp_path, "hl.trades", since_ns=t0 + H + 9)] == [3]

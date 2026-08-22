@@ -123,6 +123,7 @@ class WormWriter:
         self._hour: str | None = None
         self._path: Path | None = None
         self._fh = None
+        self._dirty = False
         self._zw = None
         self._lines = 0
         self._first_seq = 0
@@ -152,6 +153,7 @@ class WormWriter:
             "payload": payload,
         }
         self._zw.write(json.dumps(record, separators=(",", ":")).encode() + b"\n")
+        self._dirty = True
         if self._lines == 0:
             self._first_seq = self.seq
             self._first_ingest = t_ingest
@@ -181,10 +183,14 @@ class WormWriter:
         self._lines = 0
 
     def flush(self) -> None:
-        if self._zw is not None:
+        # Only when something was written: an empty flush still emits a 9-byte frame,
+        # which kept the file's mtime fresh through every websocket silence and blinded
+        # the gapwatch heartbeat (243 min of holes booked as 14 on 2026-08-20..22).
+        if self._zw is not None and self._dirty:
             self._zw.flush(zstandard.FLUSH_FRAME)
             self._fh.flush()
             os.fsync(self._fh.fileno())
+            self._dirty = False
 
     def close(self) -> None:
         if self._zw is None:

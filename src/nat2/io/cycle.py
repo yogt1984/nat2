@@ -96,9 +96,17 @@ class Cycle:
             finally:
                 job.finished(ok)
                 self.store.save(job)
+            self._action(name, results[name], ok)
         if "scan" in results:
             results["coverage"] = self._measure_overlap()
         return results
+
+    def _action(self, name: str, result: dict, ok: bool) -> None:
+        """L1 observation (or L0 ops, when the job failed) next to this cycle's data home."""
+        from nat2.io.actions import append
+        root = self.config.ledger_path.parent.parent if self.config.ledger_path.parent.name == "data" \
+            else self.config.ledger_path.parent
+        append("L1" if ok else "L0", f"cycle:{name}", result if isinstance(result, dict) else {"result": result}, root=root)
 
     async def run(self) -> None:
         loop = asyncio.get_running_loop()

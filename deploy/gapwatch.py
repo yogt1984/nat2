@@ -53,6 +53,7 @@ TAPE_SILENCE_S = 300.0
 TICK_S = 300.0
 WATCHDOG_DOWN_FACTOR = 3.0
 NAT2 = ROOT / ".venv" / "bin" / "nat2"   # the ledger is written through the CLI, never from here
+ACTIONS = ROOT / "data" / "actions.jsonl"   # L0 ops records, same shape as nat2.io.actions (TASK_2/13)
 UNITS = ("nat2-capture.service", "nat2-cycle.service", "nat2-statuspage.timer")
 # Recorded into the state JSON for the status page (TASK_2/06 reads files only,
 # never queries systemd itself) but not alerted on: nat has its own watchdog.
@@ -141,6 +142,17 @@ def ledger_incident(payload: dict) -> bool:
                               capture_output=True, timeout=60).returncode == 0
     except (OSError, subprocess.SubprocessError):
         return False
+
+
+def record_action(kind: str, message: str, now_s: float, path: Path = ACTIONS) -> None:
+    """One L0 line per watchdog event; a copied idiom, not an import (stdlib-only rule)."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a") as fh:
+            fh.write(json.dumps({"t_ingest": int(now_s * 1e9), "level": "L0", "kind": f"gapwatch:{kind}",
+                                 "payload": {"message": message}}, separators=(",", ":")) + "\n")
+    except OSError:
+        pass   # the alert already went out; the log is a convenience, not the record
 
 
 def unit_active(unit: str) -> bool:
@@ -263,6 +275,8 @@ def cmd_check() -> None:
             "name": "capture_hole", "from_ts": int(start * 1e9), "to_ts": int(end * 1e9), "minutes": minutes,
             "cause": "capture unit restarted during watchdog silence (reboot or stop); tape mtimes + manifest"})
     state["pending_incidents"] = [p for p in state.get("pending_incidents", []) if not ledger_incident(p)][-20:]
+    for kind, message in events:
+        record_action(kind, message, now_s)
     # A failed send (DNS blip, ntfy outage) must not lose the alert: queue it
     # in state and retry next tick. Bounded so a long offline stretch can't
     # grow the state file without limit.

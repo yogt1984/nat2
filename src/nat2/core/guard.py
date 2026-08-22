@@ -36,7 +36,16 @@ class Verdict:
 
 def record(ledger: Ledger, gate: str, passed: bool, detail: dict) -> Verdict:
     entry = ledger.append("gate", {"gate": gate, "passed": passed, "detail": detail})
+    _action(ledger, {"gate": gate, "passed": passed, "verdict": detail.get("verdict", "pass" if passed else "fail"),
+                     "reason": detail.get("reason"), "seq": entry.seq})
     return Verdict(gate, passed, detail, entry.ts)
+
+
+def _action(ledger: Ledger, payload: dict) -> None:
+    """L2 action next to the ledger it describes; a scratch ledger logs into its own scratch home."""
+    from nat2.io.actions import append
+    root = ledger.path.parent.parent if ledger.path.parent.name == "data" else ledger.path.parent
+    append("L2", "gate", payload, root=root)
 
 
 def latest(ledger: Ledger, gate: str) -> Verdict | None:

@@ -1,0 +1,21 @@
+# The pair roster (TASK_2/13, OBSERVATORY_DESIGN §3): which perps are observed, which
+# enter the map universe, and why. Evaluated by `nat2 roster apply`; every change is a
+# ledger entry of kind `roster`, so the universe at any verdict is reconstructible.
+#
+# Two rosters. The A-roster is captured, scanned and reported, and is the only source of
+# the map universe. The B-roster holds builder-deployed perps (`dex:COIN` names): the
+# census found the venue's largest cascades there (FINDINGS), but they are thin-booked
+# and reflexive, so they are observed and kept out of the map universe until a
+# pre-registered admission rule says otherwise (task 13 step 2). Until that entry exists
+# nothing promotes them.
+
+[include]
+top_n = 18           # A-roster: the N largest non-builder perps by 24 h notional volume ...
+min_volume = 5e6     # ... that also clear this floor (the capture's --min-volume, unchanged)
+pin = ["BTC", "ETH", "SOL"]   # always observed, volume or not
+
+[map_universe]
+min_coverage = 0.25  # `gate map` floor; coverage comes from the latest map verdict, never guessed
+
+[b_roster]
+min_volume = 5e6     # builder-deployed perps above this are observed; none enters the map universe

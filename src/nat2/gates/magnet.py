@@ -89,7 +89,9 @@ def decide(cells: list[dict]) -> dict:
     # Criterion 2: one alpha, a strict majority of cells. Best-alpha-per-cell is selection, not a win.
     by_alpha = {a: _alpha_wins(cells, a) for a in ALPHAS}
     majority = [a for a in ALPHAS if len(by_alpha[a]) > len(cells) / 2]
-    winning = max(majority, key=lambda a: len(by_alpha[a])) if majority else None
+    # Any majority makes criterion 2 true; `winning` (more wins, then the larger summed edge) only names
+    # which alpha's wins criterion 4 is read on.
+    winning = max(majority, key=lambda a: (len(by_alpha[a]), sum(r["delta_z"] for r in by_alpha[a]))) if majority else None
     alpha_cost = winning is not None and all(
         (r.get("decision_hit_rate") or 0.0) > r["threshold"] for r in by_alpha[winning])
     return {

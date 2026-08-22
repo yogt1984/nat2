@@ -30,6 +30,12 @@ EVLOG_TIMER = "nat2-evlog.timer"
 STATUSPAGE_UNIT = "nat2-statuspage.service"
 STATUSPAGE_TIMER = "nat2-statuspage.timer"
 STATUS_DIR = Path.home() / "www" / "status"
+# Host profiles (TASK_2/12, OBSERVATORY_DESIGN §3): the primary runs everything; a
+# secondary only keeps an independent tape and watches it. Same files on both hosts.
+PROFILES = {
+    "primary": (CAPTURE_UNIT, CYCLE_UNIT, GAPWATCH_TIMER, EVLOG_TIMER, STATUSPAGE_TIMER),
+    "secondary": (CAPTURE_UNIT, GAPWATCH_TIMER),
+}
 # Non-guessable alert channel (TASK_2/TASKS/01); subscribe to it in the ntfy app.
 NTFY_TOPIC = "nat2-ops-0db264232a4c36cd56e4"
 
@@ -119,7 +125,9 @@ WantedBy=timers.target
     }
 
 
-def install() -> None:
+def install(profile: str = "primary") -> None:
+    if profile not in PROFILES:
+        sys.exit(f"unknown profile {profile!r}; one of {sorted(PROFILES)}")
     unit_dir = Path.home() / ".config" / "systemd" / "user"
     unit_dir.mkdir(parents=True, exist_ok=True)
     for name in (CAPTURE_UNIT, CYCLE_UNIT):
@@ -132,12 +140,14 @@ def install() -> None:
         (unit_dir / name).write_text(text)
         print(f"wrote {unit_dir / name}")
     subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
-    subprocess.run(
-        ["systemctl", "--user", "enable", "--now", CAPTURE_UNIT, CYCLE_UNIT, GAPWATCH_TIMER, EVLOG_TIMER, STATUSPAGE_TIMER],
-        check=True,
-    )
+    subprocess.run(["systemctl", "--user", "enable", "--now", *PROFILES[profile]], check=True)
+    # Units outside the profile are installed but left disabled, so switching profile
+    # is one command rather than a file edit.
+    others = [u for units in PROFILES.values() for u in units if u not in PROFILES[profile]]
+    if others:
+        subprocess.run(["systemctl", "--user", "disable", "--now", *dict.fromkeys(others)], check=False)
     subprocess.run(["loginctl", "enable-linger"], check=False)
-    print("units enabled and started; linger requested")
+    print(f"profile {profile}: enabled {', '.join(PROFILES[profile])}; linger requested")
 
 
 if __name__ == "__main__":
@@ -145,4 +155,4 @@ if __name__ == "__main__":
         for name, text in render_units().items():
             print(f"# --- {name}\n{text}")
     else:
-        install()
+        install(sys.argv[1] if len(sys.argv) > 1 else "primary")

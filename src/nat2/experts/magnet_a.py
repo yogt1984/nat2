@@ -89,8 +89,10 @@ def build_dataset(
     negative answer, and counting it as one collapsed an earlier version of
     this label to a 0.7% positive rate.
     """
-    from nat2.labels.barriers import TIMEOUT, sample_weights, triple_barrier
+    from nat2.labels.barriers import TIMEOUT, assert_sorted, sample_weights, triple_barrier
 
+    for coin_path in paths.values():
+        assert_sorted(coin_path)   # the bisect in _window relies on it; once per path, not per row
     stats = LabelStats(rows=len(rows))
     usable = finite_rows(rows, ["close", "sigma"])
     kept, labels, t0s, results = [], [], [], []

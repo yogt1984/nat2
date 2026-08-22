@@ -32,7 +32,9 @@ triggers liquidation off the mark, not the mid.
 
 from __future__ import annotations
 
+import bisect
 from dataclasses import dataclass
+from operator import itemgetter
 
 TARGET = "target"
 OPPOSITE = "opposite"
@@ -41,6 +43,7 @@ NO_DATA = "no_data"
 INVALID = "invalid"
 
 Path = list[tuple[int, float]]
+_T = itemgetter(0)
 
 
 @dataclass(frozen=True)
@@ -60,12 +63,25 @@ class BarrierResult:
         return self.outcome == TARGET
 
 
+def assert_sorted(path: Path) -> Path:
+    """The contract `_window` relies on: non-decreasing time. Checked once per path by the
+    caller that builds a dataset, not per row -- `features.bars.iter_prints` sorts, ties by
+    arrival, so this is a tripwire for paths assembled any other way."""
+    if any(_T(a) > _T(b) for a, b in zip(path, path[1:])):
+        raise ValueError("path is not sorted by time")
+    return path
+
+
 def _window(path: Path, t0: int, horizon_ns: int):
-    """Observations strictly after t0 and no later than the vertical barrier."""
+    """Observations strictly after t0 and no later than the vertical barrier.
+
+    Bisects to the first observation after `t0` instead of walking the path from its
+    start on every call; the walk made labelling O(rows x ticks) and, repeated per
+    placebo replication, put a 200-replication cell out of reach on a month of tape.
+    """
     deadline = t0 + horizon_ns
-    for t, price in path:
-        if t <= t0:
-            continue
+    for i in range(bisect.bisect_right(path, t0, key=_T), len(path)):
+        t, price = path[i]
         if t > deadline:
             return
         yield t, price

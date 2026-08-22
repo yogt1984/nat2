@@ -33,6 +33,15 @@ def test_prints_carry_both_clocks():
     assert prints[0].notional == 100.0
 
 
+def test_coin_filter_flattens_one_coin_and_keeps_order():
+    records = [_record(1 * MS, [_trade("ETH", time_ms=5), _trade("BTC", time_ms=3)]),
+               _record(2 * MS, [_trade("BTC", time_ms=1), _trade("SOL", time_ms=2)])]
+    only = iter_prints(records, coin="BTC")
+    assert [(p.coin, p.t_event) for p in only] == [("BTC", 1 * MS), ("BTC", 3 * MS)]
+    assert only == [p for p in iter_prints(records) if p.coin == "BTC"]   # same prints, same order
+    assert iter_prints(records, coin="DOGE") == []
+
+
 def test_prints_are_sorted_by_market_time():
     records = [
         _record(10, [_trade(time_ms=300), _trade(time_ms=100)]),

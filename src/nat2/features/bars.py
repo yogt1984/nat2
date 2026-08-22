@@ -67,11 +67,13 @@ class Bar:
         return ((self.high - self.low) / self.open) if self.open else 0.0
 
 
-def iter_prints(records) -> list[Print]:
+def iter_prints(records, coin: str | None = None) -> list[Print]:
     """Flatten WORM `hl.trades` records into individual prints.
 
     Sorted by market time, ties broken by arrival order, which keeps the
-    sequence the labels rely on stable and reproducible.
+    sequence the labels rely on stable and reproducible. `coin` filters while
+    flattening: one coin's cell does not need the other seventeen in memory
+    (8 GB peak RSS on 2.5 days of tape without it).
     """
     out: list[Print] = []
     for record in records:
@@ -82,16 +84,18 @@ def iter_prints(records) -> list[Print]:
         for trade in payload:
             if not isinstance(trade, dict):
                 continue
-            coin = trade.get("coin")
+            symbol = trade.get("coin")
+            if coin is not None and symbol != coin:
+                continue
             t_event = ms_to_ns(trade.get("time")) if trade.get("time") is not None else None
             try:
                 px = float(trade.get("px"))
                 sz = abs(float(trade.get("sz")))
             except (TypeError, ValueError):
                 continue
-            if not coin or t_event is None or px <= 0 or sz <= 0:
+            if not symbol or t_event is None or px <= 0 or sz <= 0:
                 continue
-            out.append(Print(t_event, t_ingest, coin, px, sz))
+            out.append(Print(t_event, t_ingest, symbol, px, sz))
     out.sort(key=lambda p: p.t_event)
     return out
 

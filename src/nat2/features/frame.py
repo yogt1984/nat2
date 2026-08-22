@@ -18,6 +18,7 @@ and the embargo width for walk-forward is computed from those lookbacks.
 
 from __future__ import annotations
 
+import bisect
 import math
 from dataclasses import dataclass
 
@@ -29,6 +30,12 @@ from nat2.features.spec import BAND_KEYS, SHELL_KEYS, undeclared
 SIGMA_WINDOW = 30
 SIGMA_REGIME_WINDOW = 120
 LIQ_FLOW_WINDOW = 30
+# Every column the map feeds. Null, never zero, when no snapshot predates the bar.
+MAP_COLUMNS = (
+    "coverage", "published_frac", "imb_0005", "imb_001", "imb_002", "imb_005", "imb_cross_002",
+    "l_up_002", "l_dn_002", "d_near_up_pct", "d_near_dn_pct", "d_near_up", "d_near_dn", "map_age_s",
+    *(f"m_up_{s}" for s in SHELL_KEYS), *(f"m_dn_{s}" for s in SHELL_KEYS),
+)
 
 
 @dataclass
@@ -56,13 +63,11 @@ class FrameStats:
 
 
 def _as_of(rows, t: int, key):
-    """Last entry whose key is <= t. Linear; inputs are already sorted."""
-    found = None
-    for row in rows:
-        if key(row) > t:
-            break
-        found = row
-    return found
+    """Last entry whose key is <= t. Inputs are sorted, so bisect: the linear walk cost
+    rows x contexts per frame build (150M steps on a week of tape) and was repeated per
+    placebo replication."""
+    i = bisect.bisect_right(rows, t, key=key)
+    return rows[i - 1] if i else None
 
 
 def _stdev(values: list[float]) -> float | None:
@@ -145,19 +150,8 @@ def build(
             })
 
         snap = _as_of(maps, t, lambda m: m["t_ingest"])
-        if snap is None:
-            # No map predates this bar. Null, never zero -- a zero imbalance is
-            # a real reading about a balanced book, and this is the absence of
-            # any reading at all.
-            row.update({k: None for k in (
-                "coverage", "published_frac", "imb_0005", "imb_001", "imb_002",
-                "imb_005", "imb_cross_002", "l_up_002", "l_dn_002",
-                "d_near_up_pct", "d_near_dn_pct", "d_near_up", "d_near_dn",
-                "map_age_s",
-                *(f"m_up_{s}" for s in SHELL_KEYS), *(f"m_dn_{s}" for s in SHELL_KEYS))})
-        else:
-            stats.with_map += 1
-            row.update(_map_features(snap, t, sigma, row.get("day_volume")))
+        stats.with_map += snap is not None
+        row.update(_map_row(snap, t, sigma, row.get("day_volume")))
 
         row.update(_event_features(events, bar, i, bars))
         rows.append(row)
@@ -167,6 +161,27 @@ def build(
     if bad:
         raise ValueError(f"frame emitted undeclared column(s): {sorted(bad)}")
     return rows, stats
+
+
+def rebuild_map_columns(rows: list[dict], maps: list[dict]) -> list[dict]:
+    """`rows` with only their map columns recomputed from `maps`, under the same as-of rule.
+
+    For the permutation placebo: barriers are placed from volatility alone, so a permuted
+    map changes features and nothing else. Rebuilding the whole frame -- and relabelling --
+    per replication was the cost that kept 200 replications out of reach.
+    """
+    out = []
+    for row in rows:
+        t = row["t_decision"]
+        snap = _as_of(maps, t, lambda m: m["t_ingest"])
+        out.append({**row, **_map_row(snap, t, row.get("sigma"), row.get("day_volume"))})
+    return out
+
+
+def _map_row(snap: dict | None, t: int, sigma: float | None, day_volume) -> dict:
+    # No map predates this bar: null, never zero -- a zero imbalance is a real reading
+    # about a balanced book, and this is the absence of any reading at all.
+    return dict.fromkeys(MAP_COLUMNS) if snap is None else _map_features(snap, t, sigma, day_volume)
 
 
 def _map_features(snap: dict, t: int, sigma: float | None, day_volume) -> dict:

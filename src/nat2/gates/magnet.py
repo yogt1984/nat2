@@ -153,7 +153,7 @@ def cell_evaluator(root: Path, registry, placebo: int = PLACEBO_REPLICATIONS, se
     from nat2.experts.magnet_alpha import MagnetAlpha
     from nat2.features.bars import bars, iter_prints, path
     from nat2.features.context import by_coin, iter_contexts
-    from nat2.features.frame import build as build_frame
+    from nat2.features.frame import build as build_frame, rebuild_map_columns
     from nat2.io.mapsnap import STREAM, series
     from nat2.io.worm import read_records
     from nat2.validate.evaluate import evaluate
@@ -161,24 +161,23 @@ def cell_evaluator(root: Path, registry, placebo: int = PLACEBO_REPLICATIONS, se
 
     def evaluate_cell(coin: str, horizon: str, k: float) -> dict | None:
         h_ns, bar_ns = parse_window(horizon), parse_window("1m")
-        prints = iter_prints(read_records(root, "hl.trades"))
+        prints = iter_prints(read_records(root, "hl.trades"), coin=coin)
         built = bars(prints, bar_ns, coin=coin)
         contexts = by_coin(iter_contexts(read_records(root, "hl.assetctxs"))).get(coin, [])
         maps = series(read_records(root, STREAM), coin)
         events = [e for e in registry.liquidations() if e.coin == coin]
         experts = [MagnetA(horizon_ns=h_ns), *(MagnetAlpha(a, h_ns, bar_ns) for a in ALPHAS)]
-        paths = {coin: path(prints, coin)}
-
-        def score(snaps):
-            # Labels are map-invariant and the kernels read rows, not X: one set, built for MagnetA.
-            rows, _ = build_frame(built, contexts, snaps, liquidations=events, coin=coin)
-            data, _ = build_dataset(rows, paths, h_ns, experts[0].features, bar_ns=bar_ns, k=k)
-            return [evaluate(e, data, h_ns, Costs(), n_splits=5) for e in experts] if len(data) else None
-
-        real = score(maps)
-        if real is None:
+        rows, _ = build_frame(built, contexts, maps, liquidations=events, coin=coin)
+        # Labelled once (barriers come from volatility alone; a permuted map changes features only).
+        data, _ = build_dataset(rows, {coin: path(prints, coin)}, h_ns, experts[0].features, bar_ns=bar_ns, k=k)
+        if not len(data):
             return None
-        fakes = [r for r in (score(permute_series({coin: maps}, seed + i)[coin]) for i in range(placebo)) if r]
+
+        def score(d):
+            return [evaluate(e, d, h_ns, Costs(), n_splits=5) for e in experts]
+        real = score(data)
+        fakes = [score(data.with_rows(rebuild_map_columns(data.rows, permute_series({coin: maps}, seed + i)[coin])))
+                 for i in range(placebo)]
 
         def summary(j: int, **head) -> dict:
             v, zs = real[j].verdict(), [f[j].delta_z for f in fakes]

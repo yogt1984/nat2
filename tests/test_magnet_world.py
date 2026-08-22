@@ -9,7 +9,7 @@ horizon must show what a +-5% map can and cannot resolve at that scale.
 
 Placebo replications reuse the labels: barriers are placed from volatility alone, so a
 permuted map changes features and nothing else. `test_feature_rebuild_equals_the_full_frame`
-pins that shortcut to the production frame, so it is a check on the frame, not a bypass.
+pins `frame.rebuild_map_columns` + `Dataset.with_rows` (the production path) to a full rebuild.
 """
 
 import math
@@ -19,11 +19,10 @@ import pytest
 
 from nat2.core.clock import NS
 from nat2.core.costs import Costs
-from nat2.experts.base import Dataset, to_matrix
 from nat2.experts.magnet_a import MagnetA, build_dataset
 from nat2.experts.magnet_alpha import D_MIN, MagnetAlpha, asymmetry, shell_distances
 from nat2.features.bars import Bar
-from nat2.features.frame import _map_features, build
+from nat2.features.frame import build, rebuild_map_columns
 from nat2.gates import magnet as gate
 from nat2.validate.evaluate import evaluate
 from nat2.validate.placebo import PlaceboResult, permute_series
@@ -80,26 +79,9 @@ def _labelled(world, horizon_ns, k):
     return rows, data
 
 
-def _snap_index(rows, maps):
-    """For each frame row, the index of the snapshot the as-of join picked. Stable under permutation."""
-    out, j = [], -1
-    for row in rows:
-        while j + 1 < len(maps) and maps[j + 1]["t_ingest"] <= row["t_decision"]:
-            j += 1
-        out.append(j)
-    return out
-
-
-def _rebuilt(rows, data, maps, snap_index):
-    """`data` with only its map columns recomputed from `maps` -- labels and weights untouched."""
-    at = {row["t_decision"]: i for i, row in enumerate(rows)}
-    kept = []
-    for row in data.rows:
-        i = at[row["t_decision"]]
-        r = dict(rows[i])
-        r.update(_map_features(maps[snap_index[i]], r["t_decision"], r["sigma"], r.get("day_volume")))
-        kept.append(r)
-    return Dataset(data.columns, to_matrix(kept, data.columns), data.y, data.weight, kept)
+def _rebuilt(data, maps):
+    """`data` with only its map columns recomputed from `maps` -- the production shortcut."""
+    return data.with_rows(rebuild_map_columns(data.rows, maps))
 
 
 def _cell(world, horizon, k, placebo=0, seed=0):
@@ -108,10 +90,9 @@ def _cell(world, horizon, k, placebo=0, seed=0):
     rows, data = _labelled(world, h, k)
     experts = [MagnetAlpha(a, h, world.bar_ns) for a in gate.ALPHAS]
     real = [evaluate(e, data, h, Costs(), n_splits=5) for e in experts]
-    index = _snap_index(rows, world.maps)
     zs = [[] for _ in experts]
     for i in range(placebo):
-        fake = _rebuilt(rows, data, permute_series({COIN: world.maps}, seed + i)[COIN], index)
+        fake = _rebuilt(data, permute_series({COIN: world.maps}, seed + i)[COIN])
         for e, z in zip(experts, zs):
             z.append(evaluate(e, fake, h, Costs(), n_splits=5).delta_z)
 
@@ -142,12 +123,12 @@ def null():
 
 def test_feature_rebuild_equals_the_full_frame(planted):
     rows, data = _labelled(planted, HOUR, 1.0)
-    again = _rebuilt(rows, data, planted.maps, _snap_index(rows, planted.maps))
+    again = _rebuilt(data, planted.maps)
     assert again.rows == data.rows and again.y is data.y and len(again.X) == len(data.X)   # X is rows, via to_matrix
     permuted = permute_series({COIN: planted.maps}, 1)[COIN]
     full, _ = build(planted.bars, [], permuted, coin=COIN)
     full_data, _ = build_dataset(full, {COIN: planted.path}, HOUR, MagnetA.features, bar_ns=planted.bar_ns, k=1.0)
-    fast = _rebuilt(rows, data, permuted, _snap_index(rows, planted.maps))
+    fast = _rebuilt(data, permuted)
     assert fast.rows == full_data.rows and fast.y == full_data.y and fast.weight == full_data.weight
 
 

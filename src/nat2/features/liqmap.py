@@ -25,6 +25,11 @@ from nat2.features.liqmath import Position, effective
 OI_SIDES = 2.0
 
 DEFAULT_BANDS = (0.005, 0.01, 0.02, 0.05)
+# The wide band set of the v2 snapshot (TASK_2/17). At a one-week horizon and 3%/day
+# volatility, sigma*sqrt(T) is ~8% -- the whole +-5% of DEFAULT_BANDS sits inside one
+# barrier width, so a long-horizon question cannot be asked of a map that narrow. The
+# first four bands are DEFAULT_BANDS unchanged, so v1 remains a prefix of v2.
+WIDE_BANDS = (0.005, 0.01, 0.02, 0.05, 0.10, 0.20, 0.30)
 
 
 @dataclass
@@ -117,6 +122,24 @@ def nearest(liqmap: "LiqMap", min_notional: float = 0.0) -> dict:
         "down_notional": down_notional,
         "down_dist": (down_price / liqmap.mark - 1) if down_price else None,
     }
+
+
+def sparse_buckets(liqmap: "LiqMap") -> list[list[float]]:
+    """Non-empty buckets as `[lo_pct, notional, cross_notional, positions]`.
+
+    `lo_pct` is the bucket's lower edge as a fraction of the mark, which is what a kernel
+    reads and what survives a mark that moves between snapshots; the price is recoverable
+    as `mark * (1 + lo_pct)`. Empty buckets are omitted rather than stored as zeros: over
+    a +-30% span most of them are empty, and a zero and an absence mean the same thing
+    *here* only because the span is recorded alongside.
+    """
+    out = []
+    for bucket in liqmap.buckets:
+        if bucket.notional <= 0:
+            continue
+        out.append([round(bucket.low / liqmap.mark - 1, 6), bucket.notional,
+                    bucket.cross_notional, bucket.positions])
+    return out
 
 
 def build(

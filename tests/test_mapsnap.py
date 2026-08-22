@@ -153,3 +153,56 @@ def test_iter_snapshots_orders_by_arrival():
         {"t_ingest": 10, "payload": {"coins": [{"coin": "BTC"}]}},
     ]
     assert [r["t_ingest"] for r in iter_snapshots(records)] == [10, 30]
+
+
+# --- v2: wider, finer, and invisible to v1 (TASK_2/17) ---------------------
+
+def test_v2_carries_wide_bands_sparse_buckets_and_the_liquidity_fields():
+    from nat2.features.liqmap import WIDE_BANDS, build
+    from nat2.io.mapsnap import V2_BUCKET_PCT, V2_SPAN, summarise_wide
+
+    # One cluster at -1% (inside v1's span) and one at +12% (outside it entirely).
+    positions = [_position(liq=99.0, szi=2.0), _position(address="0xb", liq=112.0, szi=3.0)]
+    wide = build(positions, "BTC", 100.0, 1000.0, bands=WIDE_BANDS,
+                 bucket_pct=V2_BUCKET_PCT, span=V2_SPAN)
+    row = summarise_wide(wide, day_volume=5e6)
+    assert row["bands"] == ["0.005", "0.01", "0.02", "0.05", "0.1", "0.2", "0.3"]
+    assert row["day_volume"] == 5e6 and row["oi_notional"] == 1000.0
+    assert row["bucket_pct"] == V2_BUCKET_PCT and row["span"] == V2_SPAN
+    assert row["down"]["0.01"] == 200.0 and row["up"]["0.05"] == 0.0    # v1 could not see the +12% cluster
+    assert row["up"]["0.2"] == 300.0 and row["up_cross"]["0.2"] == 300.0
+    assert row["outside_span"] == 0                                      # +-30% holds it; +-10% would not
+    near_b, far_b = row["buckets"]
+    assert len(row["buckets"]) == 2                                      # sparse: only what carries mass
+    assert near_b == [-0.01, 200.0, 200.0, 1]                            # -1%: an exact bucket edge
+    # +12% lands in the bucket below its own edge, because `build` places on
+    # `low <= price < high` and 100*(1+0.12) is 112.00000000000001 in binary. The bucket
+    # is a display choice (band totals come from exact prices), so this is pinned, not fixed.
+    assert far_b[1:] == [300.0, 300.0, 1] and 0.12 - V2_BUCKET_PCT <= far_b[0] <= 0.12
+
+    narrow = build(positions, "BTC", 100.0, 1000.0)                      # v1 parameters, unchanged
+    assert narrow.outside_span == 1 and summarise(narrow)["up"]["0.05"] == 0.0
+
+
+def test_v1_rows_are_untouched_and_v2_is_a_separate_stream(tmp_path):
+    from nat2.io.mapsnap import STREAM_V2
+
+    registry = Registry(tmp_path / "r.sqlite")
+    registry.replace_positions([(_position(liq=99.0), "published"),
+                                (_position(address="0xb", liq=112.0), "published")])
+    _write_contexts(tmp_path, {"BTC": {"mark": 100.0}})
+    result = snapshot(registry, tmp_path)
+    assert result["coins"] == 1 and result["v2_coins"] == 1
+
+    v1 = series(read_records(tmp_path, STREAM), "BTC")[0]
+    v2 = series(read_records(tmp_path, STREAM_V2), "BTC")[0]
+    assert set(v1) == {"t_ingest", "coin", "mark", "coverage", "notional", "cross_notional",
+                       "published_frac", "positions", "skipped", "outside_span", "oi_notional",
+                       "up", "down", "imb", "imb_cross", "near"}          # v1 gained nothing
+    assert list(v1["up"]) == ["0.005", "0.01", "0.02", "0.05"] and v1["t_ingest"] == v2["t_ingest"]
+    assert set(v2) - set(v1) == {"bands", "bucket_pct", "span", "buckets", "day_volume",
+                                 "up_cross", "down_cross"}
+    # The v1 reader cannot see v2, so `gate map` and `gate magnet` keep refusing on a v2-only store.
+    (tmp_path / STREAM).rename(tmp_path / "moved-away")
+    assert series(read_records(tmp_path, STREAM), "BTC") == []
+    assert len(series(read_records(tmp_path, STREAM_V2), "BTC")) == 1

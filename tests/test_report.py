@@ -45,6 +45,13 @@ def _home(tmp_path) -> Path:
             for k, px in enumerate((100.0, 100 + (i % 2) * 0.1)):
                 w.write([{"coin": "BTC", "px": str(px), "sz": "1", "time": (t + k * NS) // 1_000_000,
                           "users": ["0xa", "0xb"]}], t_event=t + k * NS, t_ingest=t + k * NS)
+    with WormWriter(raw, "nat2.liqmap2") as w:      # v2: wide bands, sparse buckets (TASK_2/17)
+        w.write({"coins": [{"coin": "BTC", "coverage": 0.3, "mark": 100.0, "span": 0.30, "bucket_pct": 0.0025,
+                            "up": {"0.05": 1e6, "0.1": 3e6, "0.2": 4e6, "0.3": 4e6},
+                            "down": {"0.05": 2e6, "0.1": 2e6, "0.2": 9e6, "0.3": 9e6},
+                            "imb": {"0.05": 0.33, "0.1": -0.2}, "outside_span": 7,
+                            "buckets": [[-0.01, 2e6, 0.0, 1], [0.12, 3e6, 0.0, 2]]}]},
+                t_event=None, t_ingest=NOW - 10 * MIN)
     with WormWriter(raw, "nat2.liqmap") as w:
         w.write({"coins": [{"coin": "BTC", "coverage": 0.3, "imb": {"0.02": -0.5, "0.05": -0.2},
                             "near": {"up_dist": 0.01, "down_dist": -0.02}, "up": {}, "down": {}}]},
@@ -82,6 +89,11 @@ def test_daily_digest_renders_real_numbers_with_as_of_times(tmp_path):
     page = report.render(d)
     assert page.count('class="asof"') > 40 and "—" in page and "2026-08-22" in page and "<script" not in page
     assert "cycle:scan" in page and "capture_hole" in page and "hole 55m" in page and "412" in page
+    # v2 wide map: descriptive, and it must show the mass v1 cannot address.
+    (wm,) = d["wide_map"]["rows"]
+    assert wm["coin"] == "BTC" and wm["up"]["0.3"] == 4e6 and wm["outside_span"] == 7
+    assert wm["beyond_5pct"] == 3e6 and wm["sigma_1w"] > wm["sigma_1d"] > btc["sigma_1h"]
+    assert "Wide map" in page and "3.0M" in page and "beyond ±5%" in page
 
 
 def test_empty_home_says_no_data_and_weekly_adds_the_series(tmp_path):
@@ -90,6 +102,7 @@ def test_empty_home_says_no_data_and_weekly_adds_the_series(tmp_path):
     d = report.collect(tmp_path, NOW, weekly=True)
     page = report.render(d)
     assert d["pairs"]["rows"] == [] and "no pairs" in page and "never run" in page and "Observation series" in page
+    assert d["wide_map"]["rows"] == [] and "no v2 snapshot in the last 24h" in page
     assert "none in the last 7 days" in page and "ledger seq <span" in page and "seq none" not in page
     assert d["ledger_seq"] is None and "Next dates" in page
 

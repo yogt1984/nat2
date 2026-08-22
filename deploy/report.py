@@ -38,7 +38,7 @@ from nat2.core.roster import RosterSpec, evaluate  # noqa: E402
 from nat2.features.bars import bars, iter_prints  # noqa: E402
 from nat2.features.context import iter_contexts, latest  # noqa: E402
 from nat2.io import actions  # noqa: E402
-from nat2.io.mapsnap import STREAM, iter_snapshots  # noqa: E402
+from nat2.io.mapsnap import STREAM, STREAM_V2, iter_snapshots  # noqa: E402
 from nat2.io.worm import read_records  # noqa: E402
 from nat2.ledger.chain import Ledger  # noqa: E402
 
@@ -114,6 +114,30 @@ def _liquidations(db: Path, since_ns: int) -> dict[str, dict]:
     return out
 
 
+def wide_map(home: Path, now_ns: int, coins: list[str], sigmas: dict[str, float | None]) -> dict:
+    """The v2 snapshot's band masses out to +-30%, with the reach of a 1d and 1w move.
+
+    Descriptive only (TASK_2/17): nothing is pre-registered against v2 and no gate reads
+    it. It is here so the operator sees, every day, how much mass sits beyond the +-5%
+    the shipped map can address and where a weekly-scale barrier would actually land.
+    """
+    rows, asof = [], None
+    for row in iter_snapshots(read_records(home / "data" / "raw", STREAM_V2, since_ns=now_ns - 24 * HOUR)):
+        if row["coin"] in coins:
+            rows.append(row)
+            asof = max(asof or 0, row["t_ingest"])
+    newest = {r["coin"]: r for r in rows}
+    out = []
+    for coin, r in sorted(newest.items()):
+        sigma = sigmas.get(coin)
+        out.append({"coin": coin, "up": r.get("up", {}), "down": r.get("down", {}), "imb": r.get("imb", {}),
+                    "buckets": len(r.get("buckets") or []), "outside_span": r.get("outside_span"),
+                    "beyond_5pct": sum(b[1] for b in (r.get("buckets") or []) if abs(b[0]) > 0.05),
+                    "sigma_1d": sigma * 1440 ** 0.5 if sigma else None,
+                    "sigma_1w": sigma * 10080 ** 0.5 if sigma else None})
+    return {"rows": out, "asof": asof / NS if asof else None}
+
+
 def accrual(gates: dict) -> list[dict]:
     """Progress toward each forward window, from the latest gate entries' own `window` details."""
     out = []
@@ -156,7 +180,9 @@ def collect(home: Path, now_ns: int, weekly: bool) -> dict:
         **base, "now_ns": now_ns, "weekly": weekly, "home": str(home),
         "ledger_seq": (len(ledger.entries()) - 1) if ledger.entries() else None, "chain_ok": ok, "chain_msg": chain_msg,
         "disk_free_gb": usage.free / 1e9, "disk_total_gb": usage.total / 1e9,
-        "accrual": accrual(base["gates"]), "pairs": pairs(home, now_ns), "events_ahead": events_ahead(home, now_ns),
+        "accrual": accrual(base["gates"]), "pairs": (pr := pairs(home, now_ns)), "events_ahead": events_ahead(home, now_ns),
+        "wide_map": wide_map(home, now_ns, [r["coin"] for r in pr["rows"]],
+                             {r["coin"]: r["sigma_1m"] for r in pr["rows"]}),
         "actions": acts, "since_s": since / NS, "incidents": incidents,
         "holes": (base["gapwatch"].get("holes") or []),
     }
@@ -229,6 +255,19 @@ def render(d: dict) -> str:
         or '<li>none in the last 7 days</li>'
     events = "".join(f"<li>{iso(e['ts'])} <code>{html.escape(str(e['source']))}</code> {html.escape(str(e['event_id']))}</li>"
                      for e in d["events_ahead"]) or "<li>none scheduled in the next 48h</li>"
+    wm = d["wide_map"]
+    wm_asof = iso(wm["asof"])
+    wm_rows = "".join(
+        f"<tr><td>{html.escape(r['coin'])}</td>"
+        + "".join(f"<td>{metric(_num((r['up'].get(b) or 0) / 1e6, '{:,.1f}M') + ' / ' + _num((r['down'].get(b) or 0) / 1e6, '{:,.1f}M'), wm_asof)}</td>"
+                  for b in ("0.05", "0.1", "0.2", "0.3"))
+        + f"<td>{metric(_num(r['imb'].get('0.05'), '{:+.2f}') + ' / ' + _num(r['imb'].get('0.1'), '{:+.2f}'), wm_asof)}</td>"
+        + f"<td>{metric(_num(r['beyond_5pct'] / 1e6, '{:,.1f}M'), wm_asof)}</td>"
+        + f"<td>{metric(_num(r['sigma_1d'] and r['sigma_1d'] * 100, '{:.1f}%') + ' / ' + _num(r['sigma_1w'] and r['sigma_1w'] * 100, '{:.1f}%'), wm_asof)}</td>"
+        + f"<td>{metric(r['outside_span'], wm_asof)}</td></tr>" for r in wm["rows"])
+    wide_html = (f"<table><tr><th>pair</th><th>±5% ↑/↓</th><th>±10%</th><th>±20%</th><th>±30%</th>"
+                 f"<th>imb 5% / 10%</th><th>beyond ±5%</th><th>1σ 1d / 1w</th><th>outside ±30%</th></tr>{wm_rows}</table>"
+                 if wm_rows else '<p class="warn">no v2 snapshot in the last 24h (the wider map starts with the next cycle restart)</p>')
     weekly = ""
     if d["weekly"]:
         weekly = (f"<h2>6. Observation series ({len(d['obs'])} rows)</h2>{sp.svg_lines(d['obs'], sp.OBS_SERIES)}"
@@ -254,6 +293,7 @@ table{{border-collapse:collapse;width:100%;font-size:.92em}} td,th{{text-align:l
 <h3>Accrual toward the forward windows</h3><ul>{accr}</ul>
 <h2>3. Pairs ({len(p['rows'])}) — {html.escape(p['source'])}</h2><div class="wrap">{pairs_table}</div>
 <h3>Scheduled events, next 48h</h3><ul>{events}</ul>
+<h3>Wide map (v2, ±30%) — descriptive; no gate reads it</h3><div class="wrap">{wide_html}</div>
 <h2>4. Actions since the last digest ({len(d['actions'])})</h2>{acts}
 <h2>5. Incidents and holes</h2><ul>{incidents}</ul>
 {weekly}

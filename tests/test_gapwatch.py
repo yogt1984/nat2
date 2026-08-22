@@ -97,3 +97,48 @@ def test_tape_heartbeat_sees_intra_file_silence(tmp_path, monkeypatch):
     assert conds["stream:hl.trades:heartbeat"][0] and not conds["stream:hl.trades"][0]
     os.utime(f, (NOW - 30, NOW - 30))
     assert not gapwatch.conditions(NOW)["stream:hl.trades:heartbeat"][0]
+
+
+def test_capture_hole_is_measured_across_a_watchdog_silence(tmp_path, monkeypatch):
+    """TASK_2/12: a reboot silences the watchdog with the capture; the hole is still measured."""
+    import os
+    day = tmp_path / "2026-08-21"
+    day.mkdir()
+    for name, age in (("hl.trades-20260821T13-00.ndjson.zst", 3300), ("hl.trades-20260821T14-00.ndjson.zst", 5)):
+        f = day / name
+        f.write_bytes(b"x")
+        os.utime(f, (NOW - age, NOW - age))
+    monkeypatch.setattr(gapwatch, "newest_ingest", lambda: {"hl.trades": NOW - 3400})   # sealed part: exact
+    monkeypatch.setattr(gapwatch, "unit_active_since_s", lambda unit: NOW - 60)         # restarted a minute ago
+    assert gapwatch.capture_hole({"last_tick": NOW - 3600}, NOW, tmp_path) == (NOW - 3400, NOW - 60)
+    assert gapwatch.capture_hole({"last_tick": NOW - 300}, NOW, tmp_path) is None        # on time: nothing to see
+    assert gapwatch.capture_hole({}, NOW, tmp_path) is None                              # first tick ever
+    monkeypatch.setattr(gapwatch, "newest_ingest", lambda: {})                           # crashed part never sealed
+    assert gapwatch.capture_hole({"last_tick": NOW - 3600}, NOW, tmp_path) == (NOW - 3300, NOW - 60)
+    monkeypatch.setattr(gapwatch, "unit_active_since_s", lambda unit: NOW - 7200)       # capture never restarted
+    assert gapwatch.capture_hole({"last_tick": NOW - 3600}, NOW, tmp_path) is None
+
+
+def test_hole_is_alerted_once_counted_and_ledgered_with_retry(tmp_path, monkeypatch):
+    sent, ledgered, ok = [], [], [False, True]           # first ledger write fails, second succeeds
+    monkeypatch.setattr(gapwatch, "STATE_PATH", tmp_path / "state.json")
+    monkeypatch.setattr(gapwatch, "unit_active", lambda unit: True)
+    monkeypatch.setattr(gapwatch, "newest_ingest", lambda: {s: NOW for s in gapwatch.CADENCE_S})
+    monkeypatch.setattr(gapwatch, "last_observation_s", lambda: NOW)
+    monkeypatch.setattr(gapwatch, "tape_heartbeat_s", lambda *a: NOW)
+    (tmp_path / "evlog.json").write_text(json.dumps({"last_poll_ns": int(NOW * 1e9)}))
+    monkeypatch.setattr(gapwatch, "EVLOG_STATE", tmp_path / "evlog.json")
+    monkeypatch.setattr(gapwatch, "notify", lambda m, **k: sent.append(m) or True)
+    monkeypatch.setattr(gapwatch, "ledger_incident", lambda p: ledgered.append(p) or ok.pop(0))
+    monkeypatch.setattr(gapwatch, "capture_hole", lambda state, now: (NOW - 3400, NOW - 60) if now == NOW else None)
+    (tmp_path / "state.json").write_text(json.dumps({"last_tick": NOW - 3600}))
+    monkeypatch.setattr(gapwatch.time, "time", lambda: NOW)
+    gapwatch.cmd_check()
+    state = json.loads((tmp_path / "state.json").read_text())
+    assert sent and sent[0].startswith("CAPTURE HOLE 56m") and "audit feed" in sent[0]
+    assert state["gap_minutes"]["stream:hl.trades:hole"] == (3400 - 60) / 60 and state["holes"][0]["minutes"] == (3400 - 60) / 60
+    assert len(state["pending_incidents"]) == 1 and ledgered[0]["name"] == "capture_hole"    # kept for retry
+    monkeypatch.setattr(gapwatch.time, "time", lambda: NOW + 300)
+    gapwatch.cmd_check()
+    state = json.loads((tmp_path / "state.json").read_text())
+    assert state["pending_incidents"] == [] and len(ledgered) == 2 and len(sent) == 1       # retried once, no second alert

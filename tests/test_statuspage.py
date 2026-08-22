@@ -74,7 +74,7 @@ def _fixture(tmp_path: Path) -> "sp.Paths":
     results.mkdir()
     (results / "result__2025-07-30__1000_old.md").write_text("")
     return sp.Paths(ledger=ledger, gapwatch_state=state, manifest=manifest, events_dir=events,
-                    nat_data=nat_data.parent, nat_results=results)
+                    report_state=events / "no-sidecar.json", nat_data=nat_data.parent, nat_results=results)
 
 
 def test_golden(tmp_path):

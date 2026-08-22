@@ -697,6 +697,17 @@ def features_build(
         console.print(f"wrote {stats.rows} rows -> {out}")
 
 
+def _require_raw_complete(root: Path) -> None:
+    """The read side reads raw only: refuse when compacted parts have lost their raw file (TASK_2/14)."""
+    from nat2.io.compact import raw_covers_parquet
+
+    missing = raw_covers_parquet(root, Path(root).parent / "parquet")
+    if missing:
+        console.print(f"[red]refusing: {len(missing)} compacted part(s) have no raw file (e.g. {missing[0]}); "
+                      f"raw is the read side and must not be pruned[/red]")
+        raise typer.Exit(1)
+
+
 def _cell(value, fmt: str) -> str:
     """Missing renders as a dash, never as zero."""
     return "-" if value is None else fmt.format(value)
@@ -730,6 +741,7 @@ def eval_expert(
 
     name = coin.upper()
     horizon_ns = parse_window(horizon)
+    _require_raw_complete(root)
     prints = iter_prints(read_records(root, "hl.trades"), coin=name)
     built = bars(prints, parse_window(interval), coin=name)
     if not built:
@@ -1075,6 +1087,7 @@ def gate_magnet(
     from nat2.io.mapsnap import STREAM, iter_snapshots
     from nat2.io.worm import read_records
 
+    _require_raw_complete(root)
     reg, chain = Registry(registry), Ledger(ledger)
     history: dict[str, list[dict]] = {}
     for row in iter_snapshots(read_records(root, STREAM)):

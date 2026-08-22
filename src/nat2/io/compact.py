@@ -59,3 +59,21 @@ def compact(root: Path, out: Path, streams: list[str] | None = None) -> list[dic
         frame.write_parquet(dst, compression="zstd")
         written.append({"stream": entry.stream, "path": str(dst), "rows": len(rows)})
     return written
+
+
+def raw_covers_parquet(root: Path, out: Path) -> list[str]:
+    """Parquet parts whose raw file is gone. The read side (`nat2 eval`, `gate magnet`) reads
+    raw only, so a pruned raw root would silently shrink every evaluation window; until a
+    retention policy exists (TASK_2/14: raw is never pruned), a non-empty answer is a refusal."""
+    missing = []
+    for parquet in sorted(Path(out).rglob("*.parquet")):
+        stream = parquet.parent.name
+        name = parquet.name.replace(".parquet", SUFFIX)
+        if "-" not in name or stream == Path(out).name:
+            continue                                     # derived frames, not compacted parts
+        day = name.split("-", 1)[1][:8]
+        raw = Path(root) / stream / f"{day[:4]}-{day[4:6]}-{day[6:8]}" / name
+        if not raw.exists():
+            missing.append(f"{stream}/{name}")
+    return missing
+

@@ -167,6 +167,7 @@ Each was found by live operation, not by review.
 | Map defaults showed 8 rows at 0.25% | hid the **largest** cluster ($4.4M at −8.44%; $75.9M at −11.05% further out), and rescaled every bar to a false maximum | fixed — resolution/span/depth are options, truncation is reported |
 | `nat2` not on PATH; data paths relative to cwd | from `/tmp`, `nat2 wallets status` reported an **empty registry as fact** | fixed — installed default + resolution reported on every command |
 | Project marker was "any `data/` directory" | matched a stray `/tmp/data` left by an unrelated command | fixed — `.nat2` marker or a nat2 `pyproject.toml` |
+| Empty flushes touched the tape every 30 s *(2026-08-22)* | a 9-byte zstd frame kept the open file's mtime fresh while the websocket was silent, so the gapwatch heartbeat saw a live process, never a silent one: **243 min of holes in 2.5 days booked as 14** (seven holes of 17–55 min on 08-20..22; cause on the dev box: `Temporary failure in name resolution` — a 50-min crash loop after the 15:17 recycle on 08-21, and WS `OSError` reconnect storms while alive) | fixed — `flush()` is a no-op with nothing written; a tick that arrives late now measures the hole around a capture restart, alerts once, counts it in the weekly budget and ledgers an incident (`deploy/gapwatch.py`); the network itself is why the primary moves to Hetzner (TASK_2/12) |
 
 ## Operational
 

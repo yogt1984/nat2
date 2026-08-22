@@ -26,6 +26,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -93,6 +94,11 @@ def read_records(root: Path, stream: str, since_ns: int | None = None):
     root = Path(root)
     dec = zstandard.ZstdDecompressor()
     for path in sorted((root / stream).rglob(f"*{SUFFIX}")):
+        if since_ns is not None and _file_end_ns(path) <= since_ns:
+            # Files rotate on the t_ingest hour and carry it in their name, so a file
+            # that ended before `since` cannot hold a record at or after it. Without
+            # this every "last 24h" read decompressed and parsed the whole tape.
+            continue
         with path.open("rb") as fh, dec.stream_reader(fh) as reader:
             buf = b""
             while True:
@@ -111,6 +117,16 @@ def read_records(root: Path, stream: str, since_ns: int | None = None):
                     rec = json.loads(line)
                     if since_ns is None or rec["t_ingest"] >= since_ns:
                         yield rec
+
+
+def _file_end_ns(path: Path) -> int:
+    """Exclusive end of the hour a part covers, from `<stream>-<YYYYMMDDTHH>-<part>.ndjson.zst`."""
+    try:
+        hour = path.name.split(".ndjson", 1)[0].rsplit("-", 2)[-2]
+        start = datetime.strptime(hour, "%Y%m%dT%H").replace(tzinfo=timezone.utc)
+    except (IndexError, ValueError):
+        return 1 << 63   # not a rotated part: never skip it
+    return int(start.timestamp()) * 1_000_000_000 + 3600 * 1_000_000_000
 
 
 class WormWriter:

@@ -36,6 +36,7 @@ class Paths:
     gapwatch_state: Path = ROOT / "data" / "ops" / "gapwatch_state.json"
     manifest: Path = ROOT / "data" / "raw" / "_manifest.jsonl"
     events_dir: Path = ROOT / "data" / "events"
+    report_state: Path = ROOT / "data" / "ops" / "report_state.json"   # written by deploy/report.py (TASK_2/14)
     nat_data: Path = Path.home() / "nat" / "data"
     nat_results: Path = Path.home() / "nat" / "experiment_results"
 
@@ -136,10 +137,23 @@ def collect(now_s: float, paths: Paths = Paths()) -> dict:
         "nat_last_result": last_result,
         "nat_results_this_month": sum(1 for r in results if f"__{month}" in r.name),
         "events_mtime": _newest_mtime(paths.events_dir, ("*.ndjson",)),
+        "report": _read_json(paths.report_state),
     }
 
 
+def _read_json(path: Path) -> dict:
+    try:
+        data = json.loads(path.read_text())
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
 # ----------------------------------------------------------------- rendering
+
+def _fmt(v, fmt: str) -> str:
+    return "—" if not isinstance(v, (int, float)) else fmt.format(v)
+
 
 def _short(v) -> str:
     return json.dumps(v, separators=(",", ":")) if isinstance(v, (dict, list)) else str(v)
@@ -213,6 +227,20 @@ def render(d: dict) -> str:
         f"<li>{html.escape(u)}: {metric(st, gw_asof, '' if st == 'active' else 'bad')}</li>"
         for u, st in sorted((gw.get("units") or {}).items())) or '<li class="warn">gapwatch state carries no unit states yet</li>'
     open_conds = ", ".join(sorted(gw.get("open") or {})) or "none"
+    # 6. pairs and accrual, from the last report's sidecar (the venv-side script reads the tape; this page does not)
+    rp = d.get("report") or {}
+    rp_asof = _iso(rp.get("generated_s"))
+    pair_rows = "".join(
+        f"<tr><td>{html.escape(str(r.get('coin')))}</td><td>{metric(_fmt(r.get('mark'), '{:,.6g}'), rp_asof)}</td>"
+        f"<td>{metric(_fmt(r.get('sigma_1h'), '{:.2%}'), rp_asof)}</td><td>{metric(_fmt(r.get('coverage'), '{:.0%}'), rp_asof)}</td>"
+        f"<td>{metric(_fmt(r.get('imb_002'), '{:+.2f}'), rp_asof)}</td><td>{metric(r.get('liq_n', '—'), rp_asof)}</td></tr>"
+        for r in (rp.get("pairs") or {}).get("rows") or [])
+    pairs_html = (f"<table><tr><th>pair</th><th>mark</th><th>σ 1h</th><th>coverage</th><th>imb 2%</th><th>liq 24h</th></tr>{pair_rows}</table>"
+                  if pair_rows else '<p class="warn">no report sidecar yet (nat2-report.timer writes it daily)</p>')
+    accrual_html = "".join(
+        f"<li>{html.escape(str(a.get('gate')))}: " + (", ".join(f"{b.get('label')} {_fmt(b.get('have'), '{:,.0f}')} / {_fmt(b.get('need'), '{:,.0f}')}" for b in a.get("bars") or [])
+                                                      or html.escape(str(a.get("note") or "—"))) + f" {metric('', rp_asof)}</li>"
+        for a in rp.get("accrual") or []) or "<li>—</li>"
     # 4. nat health + 5. events
     pq = d["nat_parquet_mtime"]
     ev = d["events_mtime"]
@@ -247,6 +275,8 @@ table{{border-collapse:collapse;width:100%}} td,th{{text-align:left;padding:.25e
 <h2>5. Event log</h2><ul>
 <li>newest event record: {metric(_age(now, ev), _iso(ev), 'bad' if ev is None or now - ev > 1800 else '')}</li>
 </ul>
+<h2>6. Pairs and accrual (from the last digest)</h2>{pairs_html}
+<h3>Accrual toward the forward windows</h3><ul>{accrual_html}</ul>
 <p class="legend">read-only · no scripts · regenerated every 10 min by nat2-statuspage.timer</p>
 """
 

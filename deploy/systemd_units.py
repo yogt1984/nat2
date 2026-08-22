@@ -29,11 +29,14 @@ EVLOG_UNIT = "nat2-evlog.service"
 EVLOG_TIMER = "nat2-evlog.timer"
 STATUSPAGE_UNIT = "nat2-statuspage.service"
 STATUSPAGE_TIMER = "nat2-statuspage.timer"
+GATES_UNIT, GATES_TIMER = "nat2-gates.service", "nat2-gates.timer"
+REPORT_UNIT, REPORT_TIMER = "nat2-report.service", "nat2-report.timer"
 STATUS_DIR = Path.home() / "www" / "status"
+REPORTS_DIR = Path.home() / "www" / "reports"
 # Host profiles (TASK_2/12, OBSERVATORY_DESIGN §3): the primary runs everything; a
 # secondary only keeps an independent tape and watches it. Same files on both hosts.
 PROFILES = {
-    "primary": (CAPTURE_UNIT, CYCLE_UNIT, GAPWATCH_TIMER, EVLOG_TIMER, STATUSPAGE_TIMER),
+    "primary": (CAPTURE_UNIT, CYCLE_UNIT, GAPWATCH_TIMER, EVLOG_TIMER, STATUSPAGE_TIMER, GATES_TIMER, REPORT_TIMER),
     "secondary": (CAPTURE_UNIT, GAPWATCH_TIMER),
 }
 # Non-guessable alert channel (TASK_2/TASKS/01); subscribe to it in the ntfy app.
@@ -118,10 +121,48 @@ OnUnitActiveSec=10min
 [Install]
 WantedBy=timers.target
 """
+    # Daily gate pass (TASK_2/14): refusals are progress stamps; a flip pages. Then the
+    # digest half an hour later, on the venv (it reads the zstd tape), weekly on Mondays.
+    gates = f"""\
+[Unit]
+Description=nat2 gates (daily gate feed/map/magnet pass, flip alerts)
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory={root}
+Environment="NAT2_NTFY_TOPIC={NTFY_TOPIC}"
+ExecStart=/usr/bin/python3 {root / "deploy" / "gates_run.py"}
+"""
+    report = f"""\
+[Unit]
+Description=nat2 report (daily/weekly digest, static HTML)
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory={root}
+Environment="NAT2_NTFY_TOPIC={NTFY_TOPIC}"
+ExecStart={root / ".venv" / "bin" / "python"} {root / "deploy" / "report.py"} --out {REPORTS_DIR}
+"""
+    def daily(desc: str, at: str) -> str:
+        return f"""\
+[Unit]
+Description={desc}
+
+[Timer]
+OnCalendar=*-*-* {at}:00 Europe/Zurich
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+"""
     return {
         GAPWATCH_UNIT: gapwatch, GAPWATCH_TIMER: gapwatch_timer,
         EVLOG_UNIT: evlog, EVLOG_TIMER: evlog_timer,
         STATUSPAGE_UNIT: statuspage, STATUSPAGE_TIMER: statuspage_timer,
+        GATES_UNIT: gates, GATES_TIMER: daily("nat2 gates timer (06:30 CEST daily)", "06:30"),
+        REPORT_UNIT: report, REPORT_TIMER: daily("nat2 report timer (07:00 CEST daily)", "07:00"),
     }
 
 

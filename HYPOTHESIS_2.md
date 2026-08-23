@@ -16,10 +16,11 @@ are symmetric and placed from volatility alone — but the *observed* base rate 
 and a result that is not separated from momentum is worth nothing. §1.7 is where that is done,
 and it is the reason this document exists before any code.
 
-Status: **pre-registration written 2026-08-23, awaiting operator review.** Nothing in §1 has
-been evaluated. `labels/barriers.py::fade()` — the label — has existed and been tested since
-M2 and is used by nothing; the touch detector, the expert and the gate do not exist and are not
-written until §1 is on the ledger.
+Status: **registered 2026-08-23 as ledger seq 191, superseded the same day by seq 192**, and
+built. Nothing has been evaluated against it: the floors in §1.9 put the earliest verdict at
+~2026-11-07, and `gate accelerator` refuses until then. The supersession is described in §1.12
+— two defects that the synthetic worlds of §4 caught *before* any forward data existed, and
+that were registered rather than quietly applied.
 
 ---
 
@@ -120,10 +121,11 @@ which today means BTC, ETH and SOL. Coverage enters as an interaction, not a fil
 - **Baseline** `sign(F)`, no fitting, one column: `p(continuation) = 0.5·(1 + clip(F, −1, 1))`.
   It is the `α = 0` of this family, so the comparison is nested rather than a contest between
   different objects.
-- **Ablation** `magnet_b.without_map()` — the same expert with every `MAP`-sourced column
-  removed, via the existing `features.spec.by_source` idiom. This is criterion 2 below, and it
-  is the control the permutation cannot provide: a placebo shuffles map mass and leaves momentum
-  intact, so only an ablation can show the map is carrying the result.
+- **Ablation** `magnet_b.without_map()` — the same expert with the **mass** columns removed
+  (`fuel`, `brake`, `imb_fuel`), via the existing `features.spec.by_source` idiom. This is
+  criterion 2 below, and it is the control the permutation cannot provide: a placebo shuffles
+  map mass and leaves momentum intact, so only an ablation can show the map is carrying the
+  result. `touch_shell` and `touch_sweep` stay in *both* models — see §1.12.
 
 ### 1.7 Controls
 
@@ -138,7 +140,9 @@ which today means BTC, ETH and SOL. Coverage enters as an interaction, not a fil
   (`validate.placebo.permute_series`). **The touch set and the labels are held fixed** — they are
   detected on the real map and the barriers are map-independent — so the placebo asks exactly one
   question: does the *arrangement* of mass carry information? It cannot test whether the touch
-  selection does; §1.6's ablation is what does that. A cell counts as a win only at `p ≤ 0.01`.
+  selection does; §1.6's ablation is what does that. **The statistic permuted against is the
+  map's contribution** — criterion 2's full-versus-ablation margin — not the expert's total
+  skill (§1.12). A cell counts as a win only at `p ≤ 0.01`.
 - **Cost**, `Costs.threshold()` against the hash-stamped `costs.toml`: the OOS decision hit rate
   must exceed it. The measured round trip is ~11 bps and the n=5 fade reading in `FINDINGS.md`
   cleared nothing; an edge below cost is dead by arithmetic.
@@ -186,6 +190,29 @@ resume; snapshot cadence 434s → 62s, gaps over the staleness limit 100% → 0%
   that the covariate is uninformative — which is a fact about the *snapshot schema*, to be
   answered by the ±30% stream's own later entry, not by this one.
 
+### 1.12 Amendment, registered as seq 192 the same day
+
+Two defects, both found by §4's synthetic worlds **before any forward data existed**, and both
+registered rather than applied silently. The gate cannot run until ~2026-11-07, so nothing was
+evaluated under either version.
+
+1. **The ablation removed the confound along with the hypothesis.** `touch_shell` and
+   `touch_sweep` say where price is relative to the mark — geometry, and a proxy for the move
+   that got it there. Classifying them `MAP` put them inside the ablation, so in a world whose
+   continuation depends *only* on the touch bar's volatility and not on mass at all, criterion 2
+   passed at **z +9.21**. With the mass-only ablation that world gives **z +1.16** and a
+   planted-mass world gives **z +10.83**. They are now declared `BAR` and stay in both models.
+2. **The placebo was measuring the wrong thing.** `magnet_b` reads non-map columns, so a
+   permutation corrupts its baseline too and the expert-versus-baseline delta stays high for a
+   reason unrelated to the claim: in the planted-mass world that statistic gave **p = 0.16**,
+   as if a real effect had survived. The statistic is now the map's *contribution*, which in the
+   same world has **zero exceedances in 40 replications**.
+
+The worlds also show criterion 2 is not sufficient alone: in the pure-momentum world the
+mass-only ablation still leaves **z +2.73**, because `fuel` and `brake` correlate with how far
+price travelled. That world is refused by criterion 3 (**p = 0.37**), not by criterion 2 — the
+conjunction is what protects the claim, which is the reason there are four criteria and not one.
+
 ### 1.11 Provenance
 
 `source: HYPOTHESIS_1.md §2 (the threshold argument) and §3 (the free null); label
@@ -220,13 +247,19 @@ why the event timeline has been capturing since 2026-08-20 regardless of how thi
 
 - `labels/touch.py` (≤ 120 lines): touch detection from a tick path and a map series, exactly
   §1.2; returns `(t, px, side, shell, fuel, brake, F)` per touch.
-- `experts/magnet_b.py` (≤ 150): the expert, the `sign(F)` baseline, `without_map()` via the
-  existing `by_source` idiom, and the `y = (fade == −1)` labelling with a golden test on the sign.
-- `gates/accelerator.py` (≤ 150): refusal-first, modelled line-for-line on `gates/magnet.py` —
-  refuses without the pre-registration, without `gate map` PASS, or below the §1.9 floors.
-- **Tests at the horizon's scale** (≤ 200), per the standing rule: synthetic worlds in the
-  `tests/test_magnet_world.py` pattern — a planted continuation-when-fuel-exceeds-brake world is
-  found and collapses under permutation; a world where continuation follows the pre-touch move
-  only is **not** credited to mass (the ablation catches it); a driftless world yields nothing.
-- **Budget:** zero new dependencies; `validate/`, `core/costs.py`, `experts/magnet_a.py` and
-  `experts/magnet_alpha.py` untouched; `labels/barriers.py` untouched (the label already exists).
+All of it built 2026-08-23, after seq 191 and with seq 192's corrections:
+
+- `labels/touch.py` (125 lines): touch detection, §1.2 exactly.
+- `experts/magnet_b.py` (165): the expert, the `sign(F)` baseline, the ablation, and the
+  `y = (fade == −1)` labelling with a golden test on the sign.
+- `gates/accelerator.py` (193): refusal-first, modelled on `gates/magnet.py`; `nat2 gate
+  accelerator` refuses without the pre-registration, without `gate map` PASS, or below §1.9.
+- `tests/test_accelerator.py` (16 tests): the unit checks, the sign trap, the gate's rule, and
+  three worlds at the horizon's scale — planted mass is found and the placebo collapses it;
+  pure momentum passes criterion 1 at z +9.8 and is stopped by criterion 3; a null world yields
+  nothing.
+- **Also fixed:** `Dataset.select()` — an ablation is a different design matrix, not just a
+  shorter feature list, and every `without_map()` in the codebase would have raised at predict
+  time without it. `MagnetA.without_map()` had never been exercised.
+- **Budget:** zero new dependencies; `validate/`, `core/costs.py`, `experts/magnet_a.py`,
+  `experts/magnet_alpha.py` and `labels/barriers.py` untouched.

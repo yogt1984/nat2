@@ -84,6 +84,17 @@ FEATURES: dict[str, FeatureSpec] = {
         _spec("m_dn_001", MAP, 0, "liquidation notional in the (0.5%, 1%] shell below"),
         _spec("m_dn_002", MAP, 0, "liquidation notional in the (1%, 2%] shell below"),
         _spec("m_dn_005", MAP, 0, "liquidation notional in the (2%, 5%] shell below"),
+        # --- touch (HYPOTHESIS_2, ledger seq 191). Point-in-time, and MAP-sourced so the
+        # map-blind ablation of §1.6 removes exactly these and nothing else.
+        _spec("fuel", MAP, 0, "liquidation notional ahead of the sweep, beyond the touched shell, out to 5%"),
+        _spec("brake", MAP, 0, "liquidation notional behind the mark, out to 5%; fires only on a reversal"),
+        _spec("imb_fuel", MAP, 0, "(fuel - brake) / (fuel + brake); positive means continuation predicted"),
+        # BAR, not MAP: these say where price is relative to the mark, which is geometry and a
+        # proxy for the move that got it there -- not liquidation mass. Classifying them MAP put
+        # them inside the ablation, and a pure-momentum synthetic world then passed criterion 2
+        # at z +9.2 (2026-08-23). `by_source(MAP)` must mean the mass and only the mass.
+        _spec("touch_shell", BAR, 0, "index of the touched shell, 0 = innermost"),
+        _spec("touch_sweep", BAR, 0, "+1 price swept up into the shell, -1 down"),
         # --- events
         _spec("tau", EVENT, 0, "bars since the last observed liquidation in this coin"),
         _spec("liq_flow", EVENT, 30, "liquidated notional over the trailing window"),

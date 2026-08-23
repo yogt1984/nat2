@@ -18,6 +18,7 @@ from nat2.hl.info import InfoClient
 from nat2.hl.ratelimit import SharedWeightBudget
 from nat2.hl.schemas import STREAMS
 from nat2.ledger.chain import Ledger
+from nat2.io.capture import STALL_S
 
 app = typer.Typer(no_args_is_help=True, add_completion=False, help="Hyperliquid research engine")
 capture_app = typer.Typer(no_args_is_help=True, help="Capture daemons")
@@ -123,6 +124,8 @@ def capture_hl(
     coins: Annotated[str, typer.Option("--coins", help="comma-separated, or --all")] = "BTC,ETH",
     all_coins: Annotated[bool, typer.Option("--all", help="every non-delisted perp")] = False,
     roster: Annotated[bool, typer.Option("--roster", help="the A+B roster of pairs.toml (live volumes)")] = False,
+    stall_s: Annotated[float, typer.Option("--stall-s",
+        help="exit if a stream is silent this long, so the supervisor restarts; 0 disables")] = STALL_S,
     min_volume: Annotated[float, typer.Option(help="--all: min 24h notional volume")] = 0.0,
     streams: StreamsOpt = DEFAULT_STREAMS,
     root: RootOpt = RAW,
@@ -152,17 +155,28 @@ def capture_hl(
             streams=_streams(streams),
             testnet=testnet,
             poll_interval_s=poll_interval,
+            stall_s=stall_s,
         )
         console.print(
             f"[bold]capture[/bold] {len(selected)} coin(s) x {len(config.streams)} stream(s) "
             f"-> {root}  (ctrl-c to stop)"
         )
         capture = Capture(config, on_status=_print_status)
-        await capture.run()
-        _print_status(capture)
-        console.print("[dim]writers closed; manifest updated[/dim]")
+        try:
+            await capture.run()
+        finally:
+            _print_status(capture)
+            console.print("[dim]writers closed; manifest updated[/dim]")
 
-    asyncio.run(_run())
+    from nat2.io.capture import CaptureStalled
+
+    try:
+        asyncio.run(_run())
+    except CaptureStalled as exc:
+        # Not a crash: the daemon noticed it had gone silent and stood down so the
+        # supervisor can restart it. Non-zero so an unsupervised run says so too.
+        console.print(f"[red]capture stalled[/red]: {exc}")
+        raise typer.Exit(1) from None
 
 
 def _print_status(capture) -> None:

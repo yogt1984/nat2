@@ -29,6 +29,17 @@ from nat2.hl.ws import Subscription, WsClient
 from nat2.io.worm import WormWriter
 
 FLUSH_INTERVAL_S = 30.0
+# A capture that cannot resolve HL's host stays *alive*: the websocket reconnects forever
+# and the poller swallows every error, so systemd sees an active unit and `Restart=always`
+# never fires. On 2026-08-22 that cost 5.1 hours of tape in one stretch (gaierror x11 per
+# minute, `trades` frozen at 22944) and 408 minutes over 30 hours. A process that has
+# written nothing for this long is not running, so it exits and lets systemd restart it --
+# safe by construction, because a restart opens a new WORM part.
+STALL_S = 300.0
+
+
+class CaptureStalled(RuntimeError):
+    pass
 
 
 @dataclass
@@ -39,6 +50,7 @@ class CaptureConfig:
     testnet: bool = False
     poll_interval_s: float = 10.0
     status_interval_s: float = 60.0
+    stall_s: float = STALL_S        # 0 disables the watchdog
 
 
 @dataclass
@@ -65,6 +77,7 @@ class Capture:
             name: WormWriter(config.root, name) for name in config.streams
         }
         self.ws: WsClient | None = None
+        self.stalled: str | None = None
         self._stop = asyncio.Event()
 
     def _subscriptions(self) -> list[Subscription]:
@@ -86,6 +99,8 @@ class Capture:
                 loop.add_signal_handler(sig, self.stop)
 
         tasks = [asyncio.create_task(self._flusher())]
+        if self.config.stall_s:
+            tasks.append(asyncio.create_task(self._stall_watch()))
         if "hl.assetctxs" in self.writers:
             tasks.append(asyncio.create_task(self._poller()))
         if self._subscriptions():
@@ -98,7 +113,11 @@ class Capture:
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+            # Closed first: shutdown is what appends the manifest entries, so a stalled
+            # capture still leaves a complete, checksummed part behind.
             self.close()
+        if self.stalled:
+            raise CaptureStalled(self.stalled)
 
     def stop(self) -> None:
         self._stop.set()
@@ -141,6 +160,37 @@ class Capture:
                 await asyncio.sleep(self.config.poll_interval_s)
         finally:
             await info.aclose()
+
+    async def _stall_watch(self) -> None:
+        """Exit if any stream we are supposed to be filling goes silent for `stall_s`.
+
+        **Per stream, not in total.** In the 2026-08-22 outage the poller recovered while
+        the websocket stayed dead -- `assetctxs` ticked 117 -> 118 with `trades` frozen at
+        22944 -- so a watchdog on the sum would have reset its own clock and stayed blind.
+
+        The clock starts at start-up, so a daemon that comes up during an outage and never
+        connects also exits: that is precisely the observed case, one process alive for 5.4
+        hours writing nothing. Assumes each subscribed stream is naturally sub-minute
+        (18 coins of trades, a 10 s poll); a deliberately thin capture should raise
+        `--stall-s` rather than be killed for being quiet.
+        """
+        started, last, seen = now_ns(), {}, {}
+        while not self._stop.is_set():
+            await asyncio.sleep(min(self.config.stall_s / 5, 30.0))
+            now = now_ns()
+            for stream in self.writers:
+                written = self.stats.written.get(stream, 0)
+                if written > seen.get(stream, 0):
+                    seen[stream], last[stream] = written, now
+            silent = {s: (now - last.get(s, started)) / NS for s in self.writers
+                      if now - last.get(s, started) > self.config.stall_s * NS}
+            if silent:
+                self.stalled = (
+                    "silent " + ", ".join(f"{s} {age:.0f}s" for s, age in sorted(silent.items()))
+                    + f" ({self.why() or 'no errors reported'}) -- exiting so the supervisor can "
+                      "restart; the tape is a hole either way")
+                self.stop()
+                return
 
     async def _flusher(self) -> None:
         while not self._stop.is_set():

@@ -21,6 +21,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
+from nat2.core.clock import NS
 from nat2.hl.schemas import asset_contexts
 
 
@@ -120,6 +121,28 @@ def as_of(contexts: list[Context], t: int) -> Context | None:
             break
         latest = ctx
     return latest
+
+
+# Only the newest cross-section matters to a caller asking "where is the mark now", but
+# reading the stream from its start cost 59.7s per call against 0.7s for the last hour --
+# for identical values on all 232 coins. `replay` paid it every 5 minutes and `mapsnap`
+# every pass, which is why map snapshots landed ~7 minutes apart against a 60s interval
+# and were stale for over half of the tape's life. The window widens rather than returning
+# a thinner answer, so a capture hole costs time, never coins.
+MARK_WINDOWS_NS = (3600 * NS, 6 * 3600 * NS, 48 * 3600 * NS, None)
+
+
+def latest_contexts(root, windows=MARK_WINDOWS_NS) -> dict[str, Context]:
+    """Newest context per coin, reading the shortest window that yields any."""
+    from nat2.core.clock import now_ns
+    from nat2.io.worm import read_records
+
+    for window in windows:
+        found = latest(iter_contexts(read_records(root, "hl.assetctxs",
+                                                  since_ns=None if window is None else now_ns() - window)))
+        if found:
+            return found
+    return {}
 
 
 def latest(contexts: list[Context]) -> dict[str, Context]:

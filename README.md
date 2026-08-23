@@ -120,7 +120,7 @@ models, rather than in a notebook.
 | α-kernel expert | HYPOTHESIS_1 §6 criterion 2 — "some α > 0 beats α = 0" — needs a kernel exponent the learned expert does not expose | **built** under its own pre-registration (ledger seq 153); `gate magnet` can now PASS |
 | calibration | isotonic is fitted on the rows it scores, which puts a null-world model *below* the constant floor; cross-fitting is the fix | pre-registration written, **waiting to be registered** — it must land before the first verdict, not after |
 | wider map | at a one-week horizon σ√T ≈ 8 %, so the whole ±5 % of the shipped map sits inside one barrier width. `nat2.liqmap2` persists ±30 % with 0.25 % buckets — 2.2× the disk, because empty buckets are not stored | **built**; accruing since 2026-08-22. A long-horizon hypothesis is written against it no earlier than 2026-09-21, and nothing reads it before that |
-| accelerator | the magnet claim has a second half: once price *touches* a cluster, does the sweep extend or snap back? The label exists and is used by nothing | next — a touch census first, so the runnable-when is measured rather than guessed, then a pre-registration for review |
+| accelerator | the magnet claim has a second half: once price *touches* a cluster, does the sweep extend or snap back? This is the half with a mechanism rather than a belief, and the half where "price kept going after a big move" is what momentum alone predicts | census done (547 touches, ~26/day resolved at the coverage floor); [`HYPOTHESIS_2.md`](HYPOTHESIS_2.md) **written and awaiting review** — no code until it is registered |
 | attack ratio | `features/attack.py` already answers "is this cluster big enough and close enough to be worth pushing into", with exponents forced by the impact law rather than fitted, and is wired to nothing | planned — descriptive columns first; as an expert only under its own entry, after the magnet verdict |
 
 If `gate magnet` FAILs, that is a result and the next primary question is already named: whether
@@ -136,6 +136,8 @@ capturing since 08-20.
 - [`TASKS.md`](TASKS.md) — the original next-steps list and the open questions it opened.
 - [`HYPOTHESIS_1.md`](HYPOTHESIS_1.md) — the magnet claim, pre-registered: null, controls and
   decision rule fixed before the data. The concrete form of `gate magnet`.
+- [`HYPOTHESIS_2.md`](HYPOTHESIS_2.md) — the accelerator: what the forced flow does *after*
+  price reaches the cluster. Pre-registered, awaiting review; no code exists for it yet.
 - [`CONSISTENCY.md`](CONSISTENCY.md) — how the drift field is estimated, and the cross-cell
   constraint that supplies the power the sample size does not.
 - [`ATTACK.md`](ATTACK.md) — the function itself: why a cluster is worth pushing into, and why

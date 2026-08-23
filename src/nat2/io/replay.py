@@ -16,25 +16,20 @@ from pathlib import Path
 
 from nat2.core.reconstruct import apply
 from nat2.core.registry import Registry
+from nat2.features.context import latest_contexts
 from nat2.features.fills import deltas, flatten
-from nat2.hl.schemas import asset_contexts
 from nat2.io.worm import read_records
 
 WATERMARK = "tape_watermark"
 
 
 def latest_marks(root: Path) -> dict[str, float]:
-    """Most recent mark price per coin from the captured cross-section."""
-    marks: dict[str, float] = {}
-    for record in read_records(root, "hl.assetctxs"):
-        for ctx in asset_contexts(record.get("payload")):
-            mark = ctx.get("markPx")
-            if ctx.get("coin") and mark:
-                try:
-                    marks[ctx["coin"]] = float(mark)
-                except (TypeError, ValueError):
-                    continue
-    return marks
+    """Most recent mark price per coin from the captured cross-section.
+
+    Reads the newest window that has data rather than the whole stream: the answer is
+    identical and this ran every five minutes (see `features.context.latest_contexts`).
+    """
+    return {coin: ctx.mark for coin, ctx in latest_contexts(root).items() if ctx.mark}
 
 
 def replay(registry: Registry, root: Path, marks: dict[str, float] | None = None) -> dict:

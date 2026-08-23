@@ -28,7 +28,7 @@ from pathlib import Path
 
 from nat2.core.clock import now_ns
 from nat2.core.registry import Registry
-from nat2.features.context import iter_contexts, latest
+from nat2.features.context import latest_contexts
 from nat2.features.liqmap import DEFAULT_BANDS, WIDE_BANDS, build, nearest, sparse_buckets
 from nat2.io.worm import WormWriter, read_records
 
@@ -91,7 +91,7 @@ def summarise_wide(liqmap, day_volume: float | None, min_notional: float = CLUST
 
 def snapshot(registry: Registry, root: Path, coins: list[str] | None = None) -> dict:
     """Build and persist one map snapshot per coin. No API calls."""
-    contexts = latest(iter_contexts(read_records(root, "hl.assetctxs")))
+    contexts = latest_contexts(root)
     if not contexts:
         return {"skipped": "no captured asset contexts"}
 

@@ -168,3 +168,30 @@ def test_features_carry_the_arrival_clock_and_the_z_scores():
 
 def test_features_on_an_empty_series():
     assert features([], window=3) == []
+
+
+# --- the windowed reader (TASK_2/16 finding) -------------------------------
+
+def test_latest_contexts_widens_until_it_finds_data_and_never_thins_the_answer(tmp_path):
+    """Reading the whole `hl.assetctxs` stream cost 59.7s per call against 0.7s for the last
+    hour, for identical values -- and `replay` paid it every five minutes while `mapsnap`
+    paid it every pass, which is what left map snapshots ~7 min apart and stale over half
+    the time. The window must widen rather than return fewer coins."""
+    from nat2.core.clock import NS, now_ns
+    from nat2.features.context import latest_contexts
+    from nat2.io.worm import WormWriter
+
+    now = now_ns()
+    payload = lambda mark: [{"universe": [{"name": "BTC"}]},
+                            [{"markPx": str(mark), "oraclePx": str(mark), "funding": "0",
+                              "openInterest": "1", "dayNtlVlm": "1"}]]
+    with WormWriter(tmp_path, "hl.assetctxs") as w:
+        w.write(payload(100), None, now - 40 * 3600 * NS)     # older than the first two windows
+        w.write(payload(101), None, now - 30 * 3600 * NS)
+
+    windows = (3600 * NS, 6 * 3600 * NS, 48 * 3600 * NS, None)
+    found = latest_contexts(tmp_path, windows)
+    assert set(found) == {"BTC"} and found["BTC"].mark == 101.0     # newest, after widening twice
+    assert latest_contexts(tmp_path, (3600 * NS,)) == {}            # a window with nothing says nothing
+    assert latest_contexts(tmp_path, (None,))["BTC"].mark == 101.0  # the full scan agrees
+    assert latest_contexts(tmp_path / "empty") == {}

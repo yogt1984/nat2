@@ -168,6 +168,8 @@ Each was found by live operation, not by review.
 | `nat2` not on PATH; data paths relative to cwd | from `/tmp`, `nat2 wallets status` reported an **empty registry as fact** | fixed — installed default + resolution reported on every command |
 | Project marker was "any `data/` directory" | matched a stray `/tmp/data` left by an unrelated command | fixed — `.nat2` marker or a nat2 `pyproject.toml` |
 | Empty flushes touched the tape every 30 s *(2026-08-22)* | a 9-byte zstd frame kept the open file's mtime fresh while the websocket was silent, so the gapwatch heartbeat saw a live process, never a silent one: **243 min of holes in 2.5 days booked as 14** (seven holes of 17–55 min on 08-20..22; cause on the dev box: `Temporary failure in name resolution` — a 50-min crash loop after the 15:17 recycle on 08-21, and WS `OSError` reconnect storms while alive) | fixed — `flush()` is a no-op with nothing written; a tick that arrives late now measures the hole around a capture restart, alerts once, counts it in the weekly budget and ledgers an incident (`deploy/gapwatch.py`); the network itself is why the primary moves to Hetzner (TASK_2/12) |
+| A capture that cannot resolve DNS never dies *(2026-08-23)* | the websocket reconnects forever and the poller swallows every error, so systemd sees an active unit and `Restart=always` never fires: **one process ran 5.4 h with `trades` frozen at 22944**, and 408 min of tape were lost in 30 h. The poller partially recovered mid-outage (`assetctxs` 117 → 118) while the tape stayed dead, so liveness measured in total writes would have been fooled | fixed — a per-stream stall watchdog exits after 300 s of silence (clock starting at start-up, because the observed process came up *during* the outage and never wrote anything); writers close first, so the part captured is manifested, not orphaned |
+| The map was stale for over half of the tape's life *(2026-08-23)* | `replay.latest_marks` and `mapsnap.snapshot` each read `hl.assetctxs` from its start — **59.7 s against 0.7 s** for a one-hour window, identical values on all 232 coins — so the cycle's sequential pass took minutes and map snapshots landed a median **434 s** apart against a 60 s interval: **100 % of snapshot gaps in 24 h exceeded the 300 s staleness limit**. Since `match_slots` sets aside `stale_map`, over half of every liquidation *and* every cluster touch was being discarded for want of a fresh snapshot — the gate clock was running at roughly a third of its rate | fixed — `features.context.latest_contexts` reads the shortest window that yields data and widens rather than thinning the answer |
 
 ## Operational
 
@@ -186,6 +188,18 @@ inside the 2 s tolerance, but a ~600 ms shift over minutes is unexplained: NTP
 discipline or HL timestamp semantics.
 
 ## Modelling
+
+**The touch census: the accelerator question is answerable in about a month, not a year.**
+*(2026-08-23)* Counting entries into a liquidation shell carrying ≥ $50k, under the gates'
+own causality rule (map strictly earlier, ≤ 5 min old), over ~15 days and 8 coins: **547
+touches, 36/day observed** — but only **35 % of tape time had a fresh map**, so the rate a
+healthy map would show is **≈ 103/day**. Of the touches, **59 % resolve inside a 1 h
+±1σ barrier** and are therefore labellable. So 2,000 resolved touches is ~33 days at the
+repaired rate against ~94 days at the observed one, which is what makes the staleness fix
+above a prerequisite for the accelerator study rather than a tidy-up. Per coin per day:
+BTC 11.6, ETH 5.0, ZEC 5.4, PUMP 4.6, HYPE 4.2, XRP 3.9, SOL 1.3, SUI 0.
+**Whether the sweep extends or snaps back was deliberately not measured** — that is the
+hypothesis, and it is not looked at before its pre-registration is on the ledger.
 
 **The map's imbalance changes sign with how far you look.** *(2026-08-22)* The first
 wide (±30 %) build of the BTC map, from the same registry positions the shipped map

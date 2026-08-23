@@ -150,9 +150,13 @@ class WormWriter:
     def _resume_seq(self) -> int:
         entries = read_manifest(self.root, self.stream)
         last = max((e.last_seq for e in entries), default=-1)
+        # Membership as a set, not a scan per file: every snapshot opens its own part, so
+        # this stream reached 2,571 of them and the quadratic version took over three
+        # minutes per writer -- which is what starved `mapsnap` and left the map stale.
+        manifested = {e.path for e in entries}
         # An open (unmanifested) file from a previous run may hold higher seqs.
         for path in sorted((self.root / self.stream).rglob(f"*{SUFFIX}")):
-            if any(e.path == str(path.relative_to(self.root)) for e in entries):
+            if str(path.relative_to(self.root)) in manifested:
                 continue
             for rec in _tail_seqs(path):
                 last = max(last, rec)

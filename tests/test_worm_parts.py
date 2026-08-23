@@ -103,3 +103,31 @@ def test_since_skips_parts_that_ended_before_it_and_yields_the_same_records(tmp_
     assert [r["payload"]["i"] for r in read_records(tmp_path, "hl.trades", since_ns=t0)] == [2, 3]
     assert [r["payload"]["i"] for r in read_records(tmp_path, "hl.trades", since_ns=t0 - 1)] == [1, 2, 3]
     assert [r["payload"]["i"] for r in read_records(tmp_path, "hl.trades", since_ns=t0 + H + 9)] == [3]
+
+
+def test_resuming_seq_reads_the_manifest_once_and_never_reopens_a_manifested_part(tmp_path, monkeypatch):
+    """Every map snapshot opens its own part, so `nat2.liqmap` reached 2,554 of them. The
+    membership test was `any(...)` over the manifest per file -- quadratic -- and opening
+    one writer came to dominate the cycle pass (3m44s), which is what starved `mapsnap`
+    and left the map stale. Pinned as behaviour, not as a timing."""
+    import nat2.io.worm as worm
+
+    for i in range(40):                                  # 40 parts in the same hour, all manifested
+        with WormWriter(tmp_path, "nat2.liqmap") as w:
+            w.write({"i": i}, t_event=None, t_ingest=1_787_000_000_000_000_000 + i)
+    assert len(read_manifest(tmp_path, "nat2.liqmap")) == 40
+
+    opened, manifests = [], []
+    real_tail, real_manifest = worm._tail_seqs, worm.read_manifest
+    monkeypatch.setattr(worm, "_tail_seqs", lambda p: opened.append(p) or real_tail(p))
+    monkeypatch.setattr(worm, "read_manifest", lambda *a, **k: manifests.append(a) or real_manifest(*a, **k))
+
+    writer = WormWriter(tmp_path, "nat2.liqmap")
+    assert writer.seq == 40 and opened == [] and len(manifests) == 1   # nothing re-decompressed
+    # An unmanifested part -- a hard kill between the last write and close -- is still read,
+    # because only it can hold seqs the manifest has never seen.
+    with WormWriter(tmp_path, "nat2.liqmap") as w:
+        w.write({"i": 40}, t_event=None, t_ingest=1_787_000_000_000_000_040)
+    manifest = tmp_path / "_manifest.jsonl"
+    manifest.write_text("".join(manifest.read_text().splitlines(keepends=True)[:-1]))   # forget the newest
+    assert WormWriter(tmp_path, "nat2.liqmap").seq == 41 and len(opened) == 1   # seq 40 recovered from the orphan

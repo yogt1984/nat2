@@ -48,6 +48,15 @@ class Dataset:
     def positive_rate(self) -> float:
         return (sum(1 for v in self.y if v > 0) / len(self.y)) if self.y else 0.0
 
+    def select(self, columns: list[str]) -> "Dataset":
+        """The same labels, weights and rows over a subset of columns.
+
+        An ablation is a *different design matrix*, not just a different feature list: the
+        evaluator fits on `X`, so handing a six-feature expert a fourteen-column matrix fails
+        at predict time -- which is what happens to any `without_map()` used without this.
+        """
+        return Dataset(list(columns), to_matrix(self.rows, list(columns)), self.y, self.weight, self.rows)
+
     def with_rows(self, rows: list[dict]) -> "Dataset":
         """The same labels and weights over re-featured rows; row i must still be decision i."""
         if len(rows) != len(self.rows):

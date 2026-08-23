@@ -1113,6 +1113,30 @@ def gate_magnet(
     raise typer.Exit(0 if verdict.passed else 1)
 
 
+@gate_app.command("accelerator")
+def gate_accelerator(
+    root: RootOpt = RAW, registry: RegistryOpt = REGISTRY, ledger: LedgerOpt = LEDGER,
+    placebo: Annotated[int, typer.Option(help="permutation replications per cell")] = 200,
+) -> None:
+    """Run gate `accelerator`: after a touch, does the sweep continue and is it the map?"""
+    from nat2.core.registry import Registry
+    from nat2.features.bars import iter_prints, path
+    from nat2.gates import accelerator as gate
+    from nat2.io.mapsnap import STREAM, series
+    from nat2.io.worm import read_records
+    from nat2.labels.touch import touches
+
+    reg, chain = Registry(registry), Ledger(ledger)
+    coverage = (latest_verdict(chain, "map") or Verdict("map", False, {}, 0)).detail.get("coverage", {})
+    resolved = []
+    for coin in sorted(c for c, cov in coverage.items() if cov >= gate.MIN_COVERAGE):
+        prints = iter_prints(read_records(root, "hl.trades"), coin=coin)
+        resolved += [t.t for t in touches(path(prints, coin), series(read_records(root, STREAM), coin), coin)]
+    verdict = gate.run(chain, resolved, coverage, gate.cell_evaluator(root, reg, placebo), HOME)
+    console.print(json.dumps({"passed": verdict.passed, **verdict.detail}, default=str))
+    raise typer.Exit(0 if verdict.passed else 1)
+
+
 @gate_app.command("map")
 def gate_map(
     coins: Annotated[str, typer.Option("--coins")] = "BTC,ETH,SOL",

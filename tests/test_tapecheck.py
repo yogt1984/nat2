@@ -235,3 +235,15 @@ def test_a_short_pause_does_not_explain_a_long_hole():
     tiny = [rec(0, 0), rec(2_000_000, 0)]                 # 2 s of skew
     assert not tapecheck._paused(tiny, covers_s=3600.0)
     assert tapecheck._paused(tiny, covers_s=3.0)
+
+
+def test_a_full_disk_is_not_filed_as_a_network_problem():
+    """capture reports a full store as an OSError, and `OSError` is a
+    local-network marker -- so without an explicit `disk` cause ranked above it,
+    every disk-full hole would be blamed on the network."""
+    assert "OSError" in tapecheck.LOCAL_MARKS          # why this is needed
+    assert tapecheck.PRECEDENCE.index("disk") < tapecheck.PRECEDENCE.index("local-network")
+    assert "disk" in tapecheck.CAUSES
+    # The marker matches what CaptureWriteFailed actually prints.
+    assert tapecheck.DISK_MARK in (
+        "capture write failed: cannot write hl.trades to /home/onat/nat2/data/raw: ENOSPC")

@@ -66,14 +66,20 @@ SNAPSHOT = ("nat2.liqmap", "nat2.liqmap2")
 PREREG_NAME = "tapecheck_v1"
 FLOOR_KEY = "hole_floor_s"
 
-CAUSES = ("host-pause", "recycle", "stall-exit", "local-network", "venue",
+CAUSES = ("host-pause", "recycle", "disk", "stall-exit", "local-network", "venue",
           "unavailable", "unknown")
 # Resolved in this order, and the first match wins. Host-pause is first because
 # a resumed process closes its sockets, which otherwise reads as a venue fault.
-PRECEDENCE = ("host-pause", "recycle", "stall-exit", "local-network", "venue")
+# `disk` sits above `local-network` because capture reports a full store as an
+# OSError, and OSError is a local-network marker -- without this every
+# disk-full hole would be filed as a network problem.
+PRECEDENCE = ("host-pause", "recycle", "disk", "stall-exit", "local-network", "venue")
 
 RECYCLE_MARK = "Service reached runtime time limit"
 STALL_MARK = "capture stalled:"
+# The store said no. `CaptureWriteFailed` names the stream and the root, which
+# is the whole point of it being distinct from a stall.
+DISK_MARK = "cannot write"
 # `reason()` (core/errors.py) collapses an exception to its type name, so the
 # vocabulary in the journal is exception classes. getaddrinfo and ENETUNREACH
 # can only originate on this side of the wire; a timeout or a closed socket
@@ -401,6 +407,7 @@ def classify(hole: dict, reachable: bool, margin_s: float = 180.0) -> str:
     verdict = {
         "host-pause": _paused(records, hole["seconds"]),
         "recycle": RECYCLE_MARK in text,
+        "disk": DISK_MARK in text,
         "stall-exit": STALL_MARK in text,
         "local-network": any(m in text for m in LOCAL_MARKS),
         "venue": any(m in text for m in VENUE_MARKS) or bool(HTTP_5XX.search(text)),

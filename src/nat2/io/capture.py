@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import errno
 import signal
 from collections import Counter
 from dataclasses import dataclass, field
@@ -40,6 +41,15 @@ STALL_S = 300.0
 
 class CaptureStalled(RuntimeError):
     pass
+
+
+class CaptureWriteFailed(RuntimeError):
+    """The store could not be written. Distinct from a stall on purpose.
+
+    A stall says "nothing arrived"; this says "something arrived and could not
+    be kept". They call for opposite investigations, and conflating them sends
+    the operator to the venue when the answer is the disk.
+    """
 
 
 @dataclass
@@ -78,6 +88,7 @@ class Capture:
         }
         self.ws: WsClient | None = None
         self.stalled: str | None = None
+        self.write_failure: str | None = None
         self._stop = asyncio.Event()
 
     def _subscriptions(self) -> list[Subscription]:
@@ -116,8 +127,32 @@ class Capture:
             # Closed first: shutdown is what appends the manifest entries, so a stalled
             # capture still leaves a complete, checksummed part behind.
             self.close()
+        # Checked first: a store that cannot be written also looks silent, and
+        # the silence is the symptom rather than the diagnosis.
+        if self.write_failure:
+            raise CaptureWriteFailed(self.write_failure)
         if self.stalled:
             raise CaptureStalled(self.stalled)
+
+    def _write_failed(self, stream: str, exc: OSError) -> None:
+        """Stand down because the store rejected a write. Never raises.
+
+        The same shape as `_stall_watch`, and for the same reason: `run()`'s
+        `finally` is what appends the manifest entries, so standing down
+        through `stop()` leaves complete, checksummed parts behind where
+        raising out of a task would strand them.
+
+        First writer wins. A full disk fails every stream at once, and the
+        first one to notice is the one that has something useful to say.
+        """
+        if self.write_failure:
+            return
+        code = errno.errorcode.get(exc.errno, exc.errno) if exc.errno else type(exc).__name__
+        self.write_failure = (
+            f"cannot write {stream} to {self.config.root}: {code} ({exc}) -- exiting so the "
+            "supervisor can restart; the tape is a hole either way, but the disk is the cause"
+        )
+        self.stop()
 
     def stop(self) -> None:
         self._stop.set()
@@ -125,8 +160,19 @@ class Capture:
             self.ws.stop()
 
     def close(self) -> None:
-        for writer in self.writers.values():
-            writer.close()
+        """Close every writer, even if one of them cannot be.
+
+        Unguarded, the first store that fails to manifest prevented every later
+        one from manifesting -- and the OSError, raised out of `run()`'s
+        `finally`, masked the stand-down entirely and landed as a traceback.
+        Closing a part needs the disk twice (the frame, then the manifest
+        line), so this is exactly the moment a full disk bites.
+        """
+        for name, writer in self.writers.items():
+            try:
+                writer.close()
+            except OSError as exc:
+                self._write_failed(name, exc)
 
     async def _tape(self) -> None:
         self.ws = WsClient(self._subscriptions(), testnet=self.config.testnet)
@@ -135,7 +181,11 @@ class Capture:
             if stream is None or stream not in self.writers:
                 continue
             spec = STREAMS[stream]
-            self.writers[stream].write(data, spec.event_time(data), t_ingest)
+            try:
+                self.writers[stream].write(data, spec.event_time(data), t_ingest)
+            except OSError as exc:
+                self._write_failed(stream, exc)
+                return
             self.stats.bump(stream)
 
     async def _poller(self) -> None:
@@ -151,12 +201,21 @@ class Capture:
             while not self._stop.is_set():
                 try:
                     payload = await info.meta_and_asset_ctxs()
-                    writer.write(payload, None, now_ns())
-                    self.stats.bump("hl.assetctxs")
-                    self.stats.polls += 1
                 except Exception as exc:  # noqa: BLE001 - attributed below
                     self.stats.poll_errors += 1
                     self.stats.poll_failures[reason(exc)] += 1
+                else:
+                    # Split from the fetch deliberately. A venue error is
+                    # something to tolerate and count; a store that will not
+                    # take the record is not -- and inside one broad handler a
+                    # full disk became a silent no-op that never exited.
+                    try:
+                        writer.write(payload, None, now_ns())
+                    except OSError as exc:
+                        self._write_failed("hl.assetctxs", exc)
+                        return
+                    self.stats.bump("hl.assetctxs")
+                    self.stats.polls += 1
                 await asyncio.sleep(self.config.poll_interval_s)
         finally:
             await info.aclose()
@@ -176,6 +235,11 @@ class Capture:
         """
         started, last, seen = now_ns(), {}, {}
         while not self._stop.is_set():
+            if self.write_failure:
+                # Same 30 s period as the flusher, and created after it, so
+                # without this the "silent ..." message overwrites the one that
+                # names the actual cause.
+                return
             await asyncio.sleep(min(self.config.stall_s / 5, 30.0))
             now = now_ns()
             for stream in self.writers:
@@ -195,8 +259,16 @@ class Capture:
     async def _flusher(self) -> None:
         while not self._stop.is_set():
             await asyncio.sleep(FLUSH_INTERVAL_S)
-            for writer in self.writers.values():
-                writer.flush()
+            for name, writer in self.writers.items():
+                try:
+                    writer.flush()
+                except OSError as exc:
+                    # Where a full disk actually shows up: zstd buffers ~128 KB,
+                    # so a per-record `write()` never reaches the fd and the
+                    # flush is the first call that can fail. This tick is the
+                    # detection path, not a fallback for it.
+                    self._write_failed(name, exc)
+                    return
 
     async def _status(self) -> None:
         while not self._stop.is_set():

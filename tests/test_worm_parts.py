@@ -164,3 +164,33 @@ def test_a_crash_torn_manifest_line_is_skipped_wherever_it_sits(tmp_path):
     manifest.write_text("\n".join([good[0], "{not json at all}", *good[1:]]) + "\n")
     with pytest.raises(json.JSONDecodeError):
         read_manifest(tmp_path, "nat2.liqmap")
+
+
+def test_a_good_entry_appended_onto_a_torn_line_is_not_lost_with_it(tmp_path):
+    """A manifest append that runs out of disk stops mid-line, leaving no
+    trailing newline -- so the NEXT start appends its own good entry onto the
+    same physical line. Dropping the line whole loses a part that is on disk,
+    intact and checksummed, and nothing anywhere would say so.
+
+    Disk-full generates this without a crash, which is why it is worth
+    salvaging rather than merely tolerating.
+    """
+    import json
+
+    for i in range(2):
+        with WormWriter(tmp_path, "hl.trades") as writer:
+            writer.write({"i": i}, now_ns())
+
+    manifest = tmp_path / "_manifest.jsonl"
+    lines = manifest.read_text().splitlines()
+    torn = lines[1][:40]                                   # the append that ran out of disk
+    manifest.write_text(lines[0] + "\n" + torn)            # no trailing newline
+
+    with WormWriter(tmp_path, "hl.trades") as writer:      # the next start appends onto it
+        writer.write({"i": 2}, now_ns())
+
+    entries = read_manifest(tmp_path, "hl.trades")
+    paths = [e.path for e in entries]
+    assert len(entries) == 2, "the torn entry is gone, but the good one after it survives"
+    assert paths[0] == json.loads(lines[0])["path"]
+    assert paths[1] != json.loads(lines[1])["path"], "the truncated entry is not resurrected"

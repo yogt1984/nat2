@@ -207,3 +207,42 @@ def test_info_client_charges_weight_for_every_attempt():
     # A retry is another request the server counts, so it must cost us too.
     spent = sum(w for _, w in budget._events)
     assert spent == attempts["n"] * weight_of("clearinghouseState")
+
+
+def test_the_capture_daemon_spends_from_the_shared_account(tmp_path, monkeypatch):
+    """`Capture` was built without `budget=`, so it fell back to a private
+    in-memory account and its poll was invisible in data/ratelimit.sqlite.
+
+    The cost was not mis-reporting. The sweep reserves 60% of the per-IP ceiling
+    and everyone else admits against the remainder; with capture's 120
+    weight/min missing from the ledger, the sweep and the gates admitted
+    themselves as though all 1,200 were free while the venue saw up to 1,320.
+    """
+    import asyncio
+
+    from nat2.hl.ratelimit import SharedWeightBudget
+    from nat2.io.capture import Capture, CaptureConfig
+
+    shared = SharedWeightBudget(tmp_path / "ratelimit.sqlite")
+    config = CaptureConfig(root=tmp_path / "raw", coins=["BTC"], streams=("hl.assetctxs",))
+
+    captured = Capture(config, budget=shared)
+    assert captured.budget is shared
+
+    # ... and it is the account the poller actually charges.
+    asyncio.run(shared.acquire_async(20))
+    import sqlite3
+    with sqlite3.connect(shared.path) as conn:
+        rows, weight = conn.execute(
+            "SELECT COUNT(*), COALESCE(SUM(weight), 0) FROM spend").fetchone()
+    assert rows == 1 and weight == 20
+
+
+def test_the_cli_passes_the_shared_account_to_capture(monkeypatch):
+    """The regression itself: one missing keyword at the construction site."""
+    import inspect
+
+    from nat2 import cli
+
+    source = inspect.getsource(cli.capture_hl)
+    assert "Capture(config, on_status=_print_status, budget=_budget())" in source

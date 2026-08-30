@@ -66,6 +66,27 @@ def sha256_file(path: Path) -> tuple[str, int]:
     return h.hexdigest(), size
 
 
+def _salvage(record: str) -> dict | None:
+    """A complete JSON object at the END of a damaged line, or None.
+
+    A manifest append that runs out of disk stops mid-line, leaving no trailing
+    newline -- so the *next* start appends its own good entry onto the same
+    physical line. Dropping that line whole would lose the good entry with the
+    broken one, which is a silent loss of a part that is on disk and intact.
+    """
+    decoder = json.JSONDecoder()
+    for start in range(len(record)):
+        if record[start] != "{":
+            continue
+        try:
+            value, end = decoder.raw_decode(record[start:])
+        except json.JSONDecodeError:
+            continue
+        if start + end == len(record) and isinstance(value, dict):
+            return value
+    return None
+
+
 def read_manifest(root: Path, stream: str | None = None) -> list[ManifestEntry]:
     root = Path(root)
     path = root / MANIFEST
@@ -96,9 +117,13 @@ def read_manifest(root: Path, stream: str | None = None) -> list[ManifestEntry]:
         try:
             payload = json.loads(record)
         except json.JSONDecodeError:
-            if "\x00" in line or "\ufffd" in line or i == len(lines) - 1:
+            recovered = _salvage(record)
+            if recovered is not None:
+                payload = recovered
+            elif "\x00" in line or "\ufffd" in line or i == len(lines) - 1:
                 continue
-            raise
+            else:
+                raise
         entry = ManifestEntry.from_json(payload)
         if stream is None or entry.stream == stream:
             out.append(entry)

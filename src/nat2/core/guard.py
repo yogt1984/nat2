@@ -11,7 +11,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from nat2.core.clock import NS, now_ns
-from nat2.ledger.chain import Ledger
+from nat2.core.errors import reason
+from nat2.ledger.chain import Ledger, LedgerBusy
 
 # A gate verdict describes the data as it was when the gate ran.  Past this
 # age the verdict says nothing about the data you are about to use.
@@ -35,7 +36,19 @@ class Verdict:
 
 
 def record(ledger: Ledger, gate: str, passed: bool, detail: dict) -> Verdict:
-    entry = ledger.append("gate", {"gate": gate, "passed": passed, "detail": detail})
+    try:
+        entry = ledger.append("gate", {"gate": gate, "passed": passed, "detail": detail})
+    except LedgerBusy as exc:
+        # Deliberately not swallowed.  Thirteen `record` calls across four gates
+        # funnel through this line, and a Verdict returned without an entry is
+        # the one lie this system cannot afford: `nat2 gate` would print PASS,
+        # `require` would never find it, and `gates_run`'s flip detector reads
+        # the chain rather than this return value.  So the caller still fails --
+        # but the action log takes no lock, so the *loss* is recorded even when
+        # the verdict cannot be.
+        _action(ledger, {"gate": gate, "passed": passed, "verdict": "unrecorded",
+                         "reason": reason(exc), "seq": None})
+        raise
     _action(ledger, {"gate": gate, "passed": passed, "verdict": detail.get("verdict", "pass" if passed else "fail"),
                      "reason": detail.get("reason"), "seq": entry.seq})
     return Verdict(gate, passed, detail, entry.ts)

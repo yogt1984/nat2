@@ -64,10 +64,12 @@ async def scan(
 
 def candidate_observers(registry: Registry, limit: int) -> list[str]:
     """Highest-volume wallets first: whoever trades most absorbs most forced flow."""
-    import sqlite3
     from contextlib import closing
 
-    with closing(sqlite3.connect(registry.path)) as conn:
+    # Through the registry's own factory, not a bare `sqlite3.connect`: that is
+    # where the busy timeout lives, and a reader that opens its own connection
+    # would silently keep the driver default.
+    with closing(registry._connect()) as conn:
         rows = conn.execute(
             "SELECT address FROM wallets ORDER BY vlm_week DESC LIMIT ?", (limit,)
         )

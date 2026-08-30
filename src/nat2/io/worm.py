@@ -72,10 +72,34 @@ def read_manifest(root: Path, stream: str | None = None) -> list[ManifestEntry]:
     if not path.exists():
         return []
     out = []
-    for line in path.read_text().splitlines():
-        if not line.strip():
+    # A crash mid-append leaves a torn line -- on ext4 a run of NULs where the
+    # blocks were allocated but never written, then however much of the record
+    # reached the disk. It is incomplete rather than corrupt, exactly like the
+    # open data file's tail in `read_records`, and the part it describes is
+    # still on disk with its own seqs, which `_resume_seq` recovers by scanning
+    # unmanifested files.
+    #
+    # Tolerated wherever it appears, not only last. Skipping a torn line only
+    # when it is last is a rule the next append breaks: the live manifest holds
+    # 999 NULs from one unclean shutdown at line 18960, and the first `mapsnap`
+    # after the following boot appended into that gap and was itself truncated
+    # mid-key -- so the one write that got through is what made the line
+    # unreadable, and every `mapsnap` since has died on it.
+    #
+    # A malformed line with no crash signature is real corruption and still
+    # raises, which is what `gate feed` reports on.
+    lines = path.read_text(errors="replace").splitlines()
+    for i, line in enumerate(lines):
+        record = line.strip("\x00 \t\r\n\ufffd")
+        if not record:
             continue
-        entry = ManifestEntry.from_json(json.loads(line))
+        try:
+            payload = json.loads(record)
+        except json.JSONDecodeError:
+            if "\x00" in line or "\ufffd" in line or i == len(lines) - 1:
+                continue
+            raise
+        entry = ManifestEntry.from_json(payload)
         if stream is None or entry.stream == stream:
             out.append(entry)
     return out

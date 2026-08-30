@@ -13,11 +13,16 @@ must disclose.
 from __future__ import annotations
 
 import sqlite3
-from contextlib import closing
+from contextlib import closing, suppress
 from pathlib import Path
 
 from nat2.core.clock import now_ns
 from nat2.features.liqmath import Position
+
+# How long a statement waits for the writer ahead of it.  The number is the one
+# `hl/ratelimit.py` already passes to `sqlite3.connect`, so no new threshold
+# enters the code.
+BUSY_TIMEOUT_S = 10.0
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS wallets (
@@ -69,10 +74,33 @@ class Registry:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with closing(self._connect()) as conn:
+            # Once, not per connection: the mode lives in the database header,
+            # and re-issuing it on every `_connect` measured 283 us of pure
+            # overhead against a 59 us connect.  The result row has to be
+            # consumed -- an un-finalized pragma cursor defers the close, strands
+            # a journal and locks the database out for everyone else, which is
+            # the class of bug this task is removing rather than adding.
+            #
+            # Only the one-time delete->WAL conversion can fail, and only while
+            # another connection holds the database; it reports the mode it kept
+            # or raises, and either way the next construction converts it.  A
+            # Registry that refused to exist over a busy moment would be a worse
+            # outcome than one that is briefly still in rollback mode.
+            with suppress(sqlite3.OperationalError):
+                conn.execute("PRAGMA journal_mode=WAL").fetchone()
             conn.executescript(SCHEMA)
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.path)
+        # Per-connection and not persistent, so unlike the journal mode this
+        # belongs here.  Explicit rather than inherited: the driver's own default
+        # is 5 s, and this is the wait `hl/ratelimit.py` already gives a
+        # contended sqlite write, so both databases behave the same way.
+        #
+        # Under WAL readers no longer meet the writer at all -- the cycle daemon
+        # writes while sweeps, gates, the map and every ad-hoc CLI command read
+        # from other processes -- so what is left for this to absorb is only
+        # writer against writer.
+        conn = sqlite3.connect(self.path, timeout=BUSY_TIMEOUT_S)
         conn.row_factory = sqlite3.Row
         return conn
 

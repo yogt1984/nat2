@@ -32,7 +32,7 @@ from nat2.features.liquidations import population_overlap
 from nat2.hl.info import InfoClient
 from nat2.io.liqscan import candidate_observers, scan
 from nat2.io.snapshot import sweep
-from nat2.ledger.chain import Ledger
+from nat2.ledger.chain import Ledger, LedgerBusy
 
 TICK_S = 20.0
 
@@ -98,7 +98,17 @@ class Cycle:
                 self.store.save(job)
             self._action(name, results[name], ok)
         if "scan" in results:
-            results["coverage"] = self._measure_overlap()
+            try:
+                results["coverage"] = self._measure_overlap()
+            except LedgerBusy as exc:
+                # This call sits outside the per-job try above, so an unhandled
+                # raise here ends the pass and takes the daemon with it.  Not a
+                # tight crash loop -- `job.started()` persisted `last_run_ns`
+                # before we got here, so the restart re-runs at the next scan
+                # interval rather than immediately -- but one unit restart per
+                # pass on the box whose bar is consecutive clean days, to lose
+                # a reading from a series that is allowed to have gaps.
+                results["coverage"] = {"error": f"{type(exc).__name__}: {exc}"}
         return results
 
     def _action(self, name: str, result: dict, ok: bool) -> None:

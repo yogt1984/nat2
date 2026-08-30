@@ -12,6 +12,7 @@ from rich.console import Console
 from rich.table import Table
 
 from nat2.core.clock import NS, parse_window, to_dt
+from nat2.core.guard import Verdict
 from nat2.core.guard import latest as latest_verdict
 from nat2.core.paths import home, resolved
 from nat2.hl.info import InfoClient
@@ -142,13 +143,9 @@ def capture_hl(
 
     async def _run() -> None:
         selected = [c.strip() for c in coins.split(",") if c.strip()]
+        provenance = "flag"
         if all_coins or roster:
-            info = InfoClient(_budget(), testnet=testnet)
-            if roster:
-                selected = list(_live_roster(info, await info.meta_and_asset_ctxs()).captured)
-            else:
-                selected = await info.universe(min_day_volume=min_volume)
-            await info.aclose()
+            selected, provenance = await _resolve_universe(roster, min_volume, testnet)
         config = CaptureConfig(
             root=root,
             coins=selected,
@@ -159,7 +156,7 @@ def capture_hl(
         )
         console.print(
             f"[bold]capture[/bold] {len(selected)} coin(s) x {len(config.streams)} stream(s) "
-            f"-> {root}  (ctrl-c to stop)"
+            f"-> {root}  (universe: {provenance})  (ctrl-c to stop)"
         )
         capture = Capture(config, on_status=_print_status)
         try:
@@ -169,6 +166,7 @@ def capture_hl(
             console.print("[dim]writers closed; manifest updated[/dim]")
 
     from nat2.io.capture import CaptureStalled
+    from nat2.io.universe import UniverseUnavailable
 
     try:
         asyncio.run(_run())
@@ -177,6 +175,43 @@ def capture_hl(
         # supervisor can restart it. Non-zero so an unsupervised run says so too.
         console.print(f"[red]capture stalled[/red]: {exc}")
         raise typer.Exit(1) from None
+    except UniverseUnavailable as exc:
+        # Also not a crash. This used to leave a traceback and, under
+        # `Restart=always`, a loop that wrote no tape for as long as the venue
+        # was unreachable -- 2 h 17 m of it in ten days.
+        console.print(f"[red]universe unavailable[/red]: {exc}")
+        raise typer.Exit(1) from None
+
+
+async def _resolve_universe(roster: bool, min_volume: float, testnet: bool) -> tuple[list[str], str]:
+    """The capture universe, live if the venue answers and cached if it does not.
+
+    `info` is bound here and closed over by `fetch`, which is what keeps the
+    naive version's `UnboundLocalError` structurally impossible: it fired on
+    every roster start and no `--all` start, and production runs `--all`, so a
+    smoke test of the deployed unit would never have seen it.
+    """
+    from nat2.core.roster import RosterSpec
+    from nat2.io.universe import all_key, resolve, roster_key
+
+    info = InfoClient(_budget(), testnet=testnet)
+    try:
+        if roster:
+            spec = RosterSpec.load(HOME / "pairs.toml")
+
+            async def fetch() -> list[str]:
+                return list(_live_roster(await info.meta_and_asset_ctxs()).captured)
+
+            key = roster_key(spec, testnet)
+        else:
+            async def fetch() -> list[str]:
+                return await info.universe(min_day_volume=min_volume)
+
+            key = all_key(min_volume, testnet)
+        return await resolve(fetch, key, root=HOME,
+                             on_event=lambda note: console.print(f"[yellow]{note}[/yellow]"))
+    finally:
+        await info.aclose()
 
 
 def _print_status(capture) -> None:
@@ -1207,7 +1242,7 @@ def log_query(
         )
 
 
-def _live_roster(info, meta_and_ctxs):
+def _live_roster(meta_and_ctxs):
     """The roster against the venue's live cross-section; coverage from the latest map verdict."""
     from nat2.core.roster import RosterSpec, evaluate
 

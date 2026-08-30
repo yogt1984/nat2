@@ -158,7 +158,12 @@ def capture_hl(
             f"[bold]capture[/bold] {len(selected)} coin(s) x {len(config.streams)} stream(s) "
             f"-> {root}  (universe: {provenance})  (ctrl-c to stop)"
         )
-        capture = Capture(config, on_status=_print_status)
+        # Without `budget=` the daemon falls back to a private in-memory
+        # account, so its 10 s poll -- 6/min x weight 20 = 120 of the 1,200
+        # weight/min per-IP ceiling -- spends invisibly: the sweep and the
+        # gates then admit themselves as though all 1,200 were free while the
+        # venue sees up to 1,320. Every other command already passes this.
+        capture = Capture(config, on_status=_print_status, budget=_budget())
         try:
             await capture.run()
         finally:

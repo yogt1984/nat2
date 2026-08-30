@@ -15,10 +15,14 @@ from nat2.io.capture import Capture, CaptureConfig, CaptureStalled
 from nat2.io.worm import read_manifest, read_records
 
 
-def _capture(tmp_path, **kw) -> Capture:
+def _capture(tmp_path, streams=("hl.trades",), **kw) -> Capture:
     """A daemon with no subscriptions, so no websocket is opened: these tests are about
-    the watchdog, and a unit test that reaches the venue tests the venue."""
-    capture = Capture(CaptureConfig(root=tmp_path, coins=["BTC"], streams=["hl.trades"],
+    the watchdog, and a unit test that reaches the venue tests the venue.
+
+    `streams` is a parameter because the disk-full tests need more than one: the
+    done-when there is that the OTHER streams are still manifested when one of
+    them cannot be written."""
+    capture = Capture(CaptureConfig(root=tmp_path, coins=["BTC"], streams=list(streams),
                                     status_interval_s=99.0, **kw))
     capture._subscriptions = lambda: []
     return capture

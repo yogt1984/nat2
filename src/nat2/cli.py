@@ -170,7 +170,7 @@ def capture_hl(
             _print_status(capture)
             console.print("[dim]writers closed; manifest updated[/dim]")
 
-    from nat2.io.capture import CaptureStalled
+    from nat2.io.capture import CaptureStalled, CaptureWriteFailed
     from nat2.io.universe import UniverseUnavailable
 
     try:
@@ -179,6 +179,11 @@ def capture_hl(
         # Not a crash: the daemon noticed it had gone silent and stood down so the
         # supervisor can restart it. Non-zero so an unsupervised run says so too.
         console.print(f"[red]capture stalled[/red]: {exc}")
+        raise typer.Exit(1) from None
+    except CaptureWriteFailed as exc:
+        # Distinct from a stall on purpose: "silent hl.trades" sends the
+        # operator to the venue, and the answer is the disk.
+        console.print(f"[red]capture write failed[/red]: {exc}")
         raise typer.Exit(1) from None
     except UniverseUnavailable as exc:
         # Also not a crash. This used to leave a traceback and, under

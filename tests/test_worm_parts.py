@@ -131,3 +131,36 @@ def test_resuming_seq_reads_the_manifest_once_and_never_reopens_a_manifested_par
     manifest = tmp_path / "_manifest.jsonl"
     manifest.write_text("".join(manifest.read_text().splitlines(keepends=True)[:-1]))   # forget the newest
     assert WormWriter(tmp_path, "nat2.liqmap").seq == 41 and len(opened) == 1   # seq 40 recovered from the orphan
+
+
+def test_a_crash_torn_manifest_line_is_skipped_wherever_it_sits(tmp_path):
+    # A crash leaves ext4 blocks that were allocated but never written -- a run
+    # of NULs -- followed by however much of the record reached the disk. The
+    # daemon then keeps appending, so the torn line stops being the last one --
+    # and the appending write can land inside the gap and be truncated itself,
+    # which is exactly how line 18960 of the live manifest became 999 NULs
+    # followed by a record cut off mid-key.
+    import json
+
+    import pytest
+
+    for i in range(3):
+        with WormWriter(tmp_path, "nat2.liqmap") as writer:
+            writer.write({"i": i}, t_event=None, t_ingest=1_787_000_000_000_000_000 + i)
+
+    manifest = tmp_path / "_manifest.jsonl"
+    good = manifest.read_text().splitlines()
+    torn = "\x00" * 999 + '{"stream":"nat2.liqmap","path":"nat2.liqmap/2026-08-30/x.zst","lines":1,"first'
+    manifest.write_text("\n".join([good[0], torn, *good[1:]]) + "\n")
+
+    entries = read_manifest(tmp_path, "nat2.liqmap")
+    assert [e.path for e in entries] == [json.loads(line)["path"] for line in good]
+    # The part the torn line described is still on disk, so its seqs are not
+    # lost with it -- `_resume_seq` reads them off the unmanifested file.
+    assert WormWriter(tmp_path, "nat2.liqmap").seq == 3
+
+    # A malformed line carrying no crash signature is corruption rather than a
+    # torn write, and must still be reported.
+    manifest.write_text("\n".join([good[0], "{not json at all}", *good[1:]]) + "\n")
+    with pytest.raises(json.JSONDecodeError):
+        read_manifest(tmp_path, "nat2.liqmap")

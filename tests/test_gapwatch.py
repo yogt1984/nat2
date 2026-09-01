@@ -6,6 +6,8 @@ load it by path.
 
 import importlib.util
 import json
+
+import pytest
 from pathlib import Path
 
 spec = importlib.util.spec_from_file_location(
@@ -99,24 +101,89 @@ def test_tape_heartbeat_sees_intra_file_silence(tmp_path, monkeypatch):
     assert not gapwatch.conditions(NOW)["stream:hl.trades:heartbeat"][0]
 
 
-def test_capture_hole_is_measured_across_a_watchdog_silence(tmp_path, monkeypatch):
-    """TASK_2/12: a reboot silences the watchdog with the capture; the hole is still measured."""
-    import os
-    day = tmp_path / "2026-08-21"
-    day.mkdir()
-    for name, age in (("hl.trades-20260821T13-00.ndjson.zst", 3300), ("hl.trades-20260821T14-00.ndjson.zst", 5)):
-        f = day / name
-        f.write_bytes(b"x")
-        os.utime(f, (NOW - age, NOW - age))
-    monkeypatch.setattr(gapwatch, "newest_ingest", lambda: {"hl.trades": NOW - 3400})   # sealed part: exact
-    monkeypatch.setattr(gapwatch, "unit_active_since_s", lambda unit: NOW - 60)         # restarted a minute ago
-    assert gapwatch.capture_hole({"last_tick": NOW - 3600}, NOW, tmp_path) == (NOW - 3400, NOW - 60)
-    assert gapwatch.capture_hole({"last_tick": NOW - 300}, NOW, tmp_path) is None        # on time: nothing to see
-    assert gapwatch.capture_hole({}, NOW, tmp_path) is None                              # first tick ever
-    monkeypatch.setattr(gapwatch, "newest_ingest", lambda: {})                           # crashed part never sealed
-    assert gapwatch.capture_hole({"last_tick": NOW - 3600}, NOW, tmp_path) == (NOW - 3300, NOW - 60)
-    monkeypatch.setattr(gapwatch, "unit_active_since_s", lambda unit: NOW - 7200)       # capture never restarted
-    assert gapwatch.capture_hole({"last_tick": NOW - 3600}, NOW, tmp_path) is None
+def _manifest_with_hole(tmp_path, now_s, gap_s=3400.0, stream="hl.trades"):
+    """A two-part manifest for `stream` with one gap, inside now_s's ISO week."""
+    import json as _json
+
+    week = gapwatch.week_start_s(now_s)
+    a_end = week + 3600
+    b_start = a_end + gap_s
+    rows = [
+        {"stream": stream, "path": f"{stream}/d/a.zst", "lines": 1, "bytes": 1,
+         "sha256": "0" * 64, "first_seq": 0, "last_seq": 9,
+         "first_ingest": int(week * 1e9), "last_ingest": int(a_end * 1e9),
+         "closed_at": int(a_end * 1e9)},
+        {"stream": stream, "path": f"{stream}/d/b.zst", "lines": 1, "bytes": 1,
+         "sha256": "0" * 64, "first_seq": 10, "last_seq": 19,
+         "first_ingest": int(b_start * 1e9), "last_ingest": int((b_start + 60) * 1e9),
+         "closed_at": int((b_start + 60) * 1e9)},
+    ]
+    manifest = tmp_path / "_manifest.jsonl"
+    manifest.write_text("".join(_json.dumps(r) + "\n" for r in rows))
+    ledger = tmp_path / "ledger.jsonl"
+    ledger.write_text(_json.dumps({"seq": 0, "kind": "preregistration",
+                                   "payload": {"name": "tapecheck_v1", "hole_floor_s": 60.0}}) + "\n")
+    return manifest, ledger
+
+
+def test_every_hole_is_booked_not_only_the_ones_the_watchdog_slept_through(tmp_path):
+    """The old reconstruction ran only when this watchdog's own tick was >= 900 s
+    late, so every outage it survived was invisible -- the state booked 62.3 min
+    for ISO-W35 against 758.4 min sitting in the manifest. Against the live
+    store this booker reports 1,817 min for that week."""
+    manifest, ledger = _manifest_with_hole(tmp_path, NOW)
+
+    on_time = {"last_tick": NOW - 300}                    # the watchdog was never late
+    events = gapwatch.book_holes(on_time, NOW, manifest=manifest, ledger=ledger)
+    assert events and "TAPE HOLE" in events[0][1]
+    assert on_time["gap_minutes"]["stream:hl.trades:hole"] == pytest.approx(3400 / 60)
+
+
+def test_a_hole_is_booked_once_however_many_ticks_see_it(tmp_path):
+    # Keyed on the hole's absolute start. An offset from "now" is a different
+    # key every tick, and books one outage repeatedly.
+    manifest, ledger = _manifest_with_hole(tmp_path, NOW)
+    state = {}
+    first = gapwatch.book_holes(state, NOW, manifest=manifest, ledger=ledger)
+    booked = dict(state["gap_minutes"])
+    second = gapwatch.book_holes(state, NOW + 300, manifest=manifest, ledger=ledger)
+    assert first and not second
+    assert state["gap_minutes"] == booked
+
+
+def test_snapshot_streams_are_never_booked_as_holes(tmp_path):
+    """nat2.liqmap* open a writer per snapshot, so the gap between parts IS the
+    cadence -- 64.5 s, over the 60 s floor. Booking them yielded 7,512 phantom
+    holes and 10,077 phantom minutes for one week, burying the 1,817 real ones."""
+    manifest, ledger = _manifest_with_hole(tmp_path, NOW, gap_s=3400.0, stream="nat2.liqmap2")
+    state = {}
+    assert gapwatch.book_holes(state, NOW, manifest=manifest, ledger=ledger) == []
+    assert "gap_minutes" not in state or not state["gap_minutes"]
+    assert "nat2.liqmap2" in gapwatch.CADENCE_S       # watched for staleness, though
+
+
+def test_without_the_pre_registered_floor_nothing_is_booked_but_the_watch_goes_on(tmp_path):
+    manifest, _ = _manifest_with_hole(tmp_path, NOW)
+    bare = tmp_path / "empty-ledger.jsonl"
+    bare.write_text("")
+    state = {}
+    assert gapwatch.book_holes(state, NOW, manifest=manifest, ledger=bare) == []
+
+
+def test_the_restart_time_is_wall_clock_not_monotonic(monkeypatch):
+    """CLOCK_MONOTONIC does not advance across suspend and /proc/uptime's
+    CLOCK_BOOTTIME does, so the old arithmetic drifted by however long the box
+    had slept: 908 minutes for nat2-capture on this host, which put every
+    reconstructed restart fifteen hours before the truth."""
+    class Done:
+        stdout = "@1788085325\n"
+
+    calls = []
+    monkeypatch.setattr(gapwatch.subprocess, "run",
+                        lambda argv, **k: calls.append(argv) or Done())
+    assert gapwatch.unit_active_since_s("nat2-cycle.service") == 1788085325.0
+    assert "--timestamp=unix" in calls[0]
+    assert not any("Monotonic" in a for a in calls[0])
 
 
 def test_hole_is_alerted_once_counted_and_ledgered_with_retry(tmp_path, monkeypatch):
@@ -130,14 +197,25 @@ def test_hole_is_alerted_once_counted_and_ledgered_with_retry(tmp_path, monkeypa
     monkeypatch.setattr(gapwatch, "EVLOG_STATE", tmp_path / "evlog.json")
     monkeypatch.setattr(gapwatch, "notify", lambda m, **k: sent.append(m) or True)
     monkeypatch.setattr(gapwatch, "ledger_incident", lambda p: ledgered.append(p) or ok.pop(0))
-    monkeypatch.setattr(gapwatch, "capture_hole", lambda state, now: (NOW - 3400, NOW - 60) if now == NOW else None)
+    def _one_hole(state, now, **kw):
+        if now != NOW or "booked" in state:
+            return []
+        state["booked"] = True
+        state.setdefault("gap_minutes", {})["stream:hl.trades:hole"] = (3400 - 60) / 60
+        state["holes"] = [{"stream": "hl.trades", "from_s": NOW - 3400, "to_s": NOW - 60,
+                           "minutes": (3400 - 60) / 60}]
+        state.setdefault("pending_incidents", []).append({"name": "tape_hole", "minutes": 55.7})
+        return [("open", "TAPE HOLE hl.trades 56m (08-21 13:00:00Z -> 08-21 13:56:00Z); "
+                         "`deploy/tapecheck.py` has the cause")]
+
+    monkeypatch.setattr(gapwatch, "book_holes", _one_hole)
     (tmp_path / "state.json").write_text(json.dumps({"last_tick": NOW - 3600}))
     monkeypatch.setattr(gapwatch.time, "time", lambda: NOW)
     gapwatch.cmd_check()
     state = json.loads((tmp_path / "state.json").read_text())
-    assert sent and sent[0].startswith("CAPTURE HOLE 56m") and "audit feed" in sent[0]
+    assert sent and sent[0].startswith("TAPE HOLE hl.trades 56m") and "tapecheck" in sent[0]
     assert state["gap_minutes"]["stream:hl.trades:hole"] == (3400 - 60) / 60 and state["holes"][0]["minutes"] == (3400 - 60) / 60
-    assert len(state["pending_incidents"]) == 1 and ledgered[0]["name"] == "capture_hole"    # kept for retry
+    assert len(state["pending_incidents"]) == 1 and ledgered[0]["name"] == "tape_hole"       # kept for retry
     monkeypatch.setattr(gapwatch.time, "time", lambda: NOW + 300)
     gapwatch.cmd_check()
     state = json.loads((tmp_path / "state.json").read_text())

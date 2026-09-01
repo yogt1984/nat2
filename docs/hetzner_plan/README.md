@@ -33,7 +33,7 @@ Sources: the audited assessment, runbook and implementation specs
 | 16 | Caddy and DNS | todo |
 | 17 | External dead-man | todo |
 | 18 | **The cutover** | todo |
-| 19 | gapwatch honesty (T5) | todo |
+| 19 | gapwatch honesty (T5) | **done** |
 | 20 | Clean-days and pre-registration (T8) | todo |
 | 21 | Testing agents (T12) | todo |
 | 22 | The seven-day count | todo |

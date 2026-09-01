@@ -20,7 +20,7 @@ import subprocess
 import sys
 import time
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -39,7 +39,17 @@ CADENCE_S = {
     "hl.trades": 3600.0,
     "hl.l2book": 3600.0,
     "hl.assetctxs": 3600.0,
-    "nat2.liqmap": 3600.0,
+    # Re-measured 2026-09-02 over the last 400 parts of each stream: the ws
+    # streams still rotate hourly (3599.8 / 3598.0 / 3596.1 s medians), but the
+    # snapshot streams land every 64.5 s, not hourly. The 3600 here was true
+    # when liqmap was written once per scan pass and stopped being true when
+    # `mapsnap_interval_ns` became 60 s (io/cycle.py) -- 56x too slow, so an
+    # 18-hour liqmap outage paged after two hours instead of ten minutes.
+    # 300 s rather than the measured 64.5: five cadences of slack absorbs a
+    # slow pass without crying wolf, and GAP_FACTOR doubles it again.
+    "nat2.liqmap": 300.0,
+    # Absent entirely until now, so 210 MB of snapshots went unwatched.
+    "nat2.liqmap2": 300.0,
 }
 GAP_FACTOR = 2.0
 # Intra-file holes: a 33-min capture outage on 2026-08-20 18:21-18:54 sat inside
@@ -62,6 +72,15 @@ DISK_MIN_FREE_GB = 20.0
 OBS_SILENCE_S = 7200.0  # 2x the 1 h liquidation-scan cadence
 WEEK_BUDGET_MIN = 60.0  # REDUCED_SPECS §7.2: gap-minutes/week per stream
 NTFY_ENV = "NAT2_NTFY_TOPIC"
+
+# tapecheck owns the hole definition (hetzner_plan 10). Imported rather than
+# re-derived: two implementations of "hole" that disagree is worse than either
+# alone, which is why 10 had to land before this.
+sys.path.insert(0, str(ROOT / "deploy"))
+from tapecheck import CONTINUOUS, for_stream, holes as tc_holes  # noqa: E402
+from tapecheck import preregistered_floor, read_manifest as tc_manifest  # noqa: E402
+
+NS = 1_000_000_000
 
 
 def tail_lines(path: Path, max_bytes: int = 65536) -> list[str]:
@@ -106,33 +125,108 @@ def last_observation_s(ledger: Path = LEDGER) -> float | None:
 
 
 def unit_active_since_s(unit: str) -> float | None:
-    """Epoch seconds at which `unit` last became active; None if unknown or inactive."""
+    """Wall-clock epoch at which `unit` last became active; None if unknown.
+
+    Read straight off systemd with `--timestamp=unix` rather than added up from
+    `ActiveEnterTimestampMonotonic` plus boot time. CLOCK_MONOTONIC does not
+    advance while the box is suspended and /proc/uptime's CLOCK_BOOTTIME does,
+    so the two drift apart by however long the machine has slept: measured on
+    this host today, **908 minutes** for nat2-capture and 42 for nat2-cycle.
+    Every restart reconstructed from the old arithmetic was that far in the
+    past, and so was every hole measured from it.
+
+    Needs systemd >= 247 for `--timestamp=unix`; this box runs 255.
+    """
     try:
-        mono = subprocess.run(["systemctl", "--user", "show", "-p", "ActiveEnterTimestampMonotonic",
-                               "--value", unit], capture_output=True, text=True, timeout=10).stdout.strip()
-        boot = time.time() - float(Path("/proc/uptime").read_text().split()[0])
-        return boot + int(mono) / 1e6 if mono.isdigit() and int(mono) else None
-    except (OSError, ValueError, subprocess.SubprocessError):
+        out = subprocess.run(
+            ["systemctl", "--user", "show", "-p", "ActiveEnterTimestamp",
+             "--timestamp=unix", "--value", unit],
+            capture_output=True, text=True, timeout=10).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    try:
+        return float(out.lstrip("@")) or None
+    except ValueError:
         return None
 
 
-def capture_hole(state: dict, now_s: float, tape_dir: Path = TAPE_DIR, unit: str = UNITS[0]):
-    """(start_s, end_s) of the tape hole around a capture restart that this watchdog slept
-    through; None when the watchdog was on time, the capture did not restart, or no hole."""
-    last = state.get("last_tick")
-    if last is None or now_s - last < WATCHDOG_DOWN_FACTOR * TICK_S:
-        return None
-    restart = unit_active_since_s(unit)
-    if restart is None or restart < last:
-        return None
-    before = [f.stat().st_mtime for f in tape_dir.glob("*/*.zst") if f.stat().st_mtime < restart]
-    if not before:
-        return None
-    # The newest file's mtime is its last write (a crashed part) or its close (a sealed part, up to
-    # a rotation late); when the manifest's last record sits within a tick of it, that is exact.
-    sealed = newest_ingest().get("hl.trades", 0.0)
-    start = sealed if sealed and 0 <= max(before) - sealed < TICK_S else max(before)
-    return (start, restart) if restart - start > TAPE_SILENCE_S else None
+def week_start_s(now_s: float) -> float:
+    """Midnight UTC on the Monday of `now_s`'s ISO week.
+
+    The booking window matches the accounting window: `gap_minutes` is keyed by
+    ISO week and cleared when the week rolls, so booking further back would
+    credit this week with last week's outages.
+    """
+    moment = datetime.fromtimestamp(now_s, timezone.utc)
+    monday = moment - timedelta(days=moment.weekday(), hours=moment.hour,
+                                minutes=moment.minute, seconds=moment.second,
+                                microseconds=moment.microsecond)
+    return monday.timestamp()
+
+
+def book_holes(state: dict, now_s: float, manifest: Path = MANIFEST,
+               ledger: Path = LEDGER) -> list[tuple[str, str]]:
+    """Book every manifest hole this ISO week, once each.
+
+    The reconstruction this replaces only ran when the watchdog's own tick was
+    >= 900 s late, so every outage it *survived* was invisible: the state books
+    62.3 min for ISO-W35 against 758.4 min sitting in the manifest. Absence is
+    not less real for having been observed on time.
+
+    Idempotent on the hole's absolute start in nanoseconds. An offset from
+    "now" is a different key every tick, which books one outage repeatedly --
+    and a counter that grows without an outage is worse than one that misses.
+
+    The floor is policy (`tapecheck_v1`). Without it nothing is booked and the
+    watchdog carries on watching: refusing to run would blind the only alarm
+    over a number that governs bookkeeping.
+    """
+    floor = preregistered_floor(ledger)
+    if floor is None:
+        return []
+    # Not wrapped in a bare `except OSError`. The first version passed a
+    # directory where tapecheck wants the manifest file, and the resulting
+    # IsADirectoryError -- an OSError -- would have been swallowed into "no
+    # holes today", forever, silently. A watchdog that books nothing must fail
+    # loudly enough to be noticed; a missing file is the only tolerated case.
+    if not manifest.exists():
+        return []
+    entries = tc_manifest(manifest)
+
+    booked: dict = state.setdefault("booked_holes", {})
+    since_ns, until_ns = int(week_start_s(now_s) * NS), int(now_s * NS)
+    events: list[tuple[str, str]] = []
+    # CONTINUOUS, not CADENCE_S. The cadence table answers "is this stream live
+    # now" and rightly includes the snapshot streams; hole booking answers "was
+    # there an absence between parts", which for a stream that opens a writer
+    # per snapshot is meaningless -- its 64.5 s cadence clears the 60 s floor,
+    # so every ordinary gap books as a hole. Measured before this line existed:
+    # 7,512 phantom holes and 10,077 phantom minutes per snapshot stream for a
+    # single week, which would have buried the 1,817 real ones.
+    for stream in CONTINUOUS:
+        series = for_stream(entries, stream)
+        for hole in tc_holes(series, since_ns, until_ns, floor):
+            key = str(hole["from_ns"])
+            if key in booked:
+                continue                       # per hole, so a NEW one still pages
+            minutes = hole["seconds"] / 60
+            booked[key] = round(minutes, 3)
+            name = f"stream:{stream}:hole"
+            gaps = state.setdefault("gap_minutes", {})
+            gaps[name] = gaps.get(name, 0.0) + minutes
+            state["holes"] = (state.get("holes") or [])[-19:] + [
+                {"stream": stream, "from_s": hole["from_ns"] / NS,
+                 "to_s": hole["to_ns"] / NS, "minutes": minutes}]
+            span = " -> ".join(
+                datetime.fromtimestamp(t / NS, timezone.utc).strftime("%m-%d %H:%M:%SZ")
+                for t in (hole["from_ns"], hole["to_ns"]))
+            events.append(("open", f"TAPE HOLE {stream} {minutes:.0f}m ({span}); "
+                                   "`deploy/tapecheck.py` has the cause"))
+            state.setdefault("pending_incidents", []).append({
+                "name": "tape_hole", "stream": stream, "from_ts": hole["from_ns"],
+                "to_ts": hole["to_ns"], "minutes": minutes,
+                "cause": "manifest gap over the pre-registered floor; see tapecheck"})
+    return events
 
 
 def ledger_incident(payload: dict) -> bool:
@@ -198,7 +292,9 @@ def tick(state: dict, conds: dict[str, tuple[bool, str]], now_s: float) -> list[
     """
     week = datetime.fromtimestamp(now_s, timezone.utc).strftime("%G-W%V")
     if state.get("week") != week:
-        state["week"], state["gap_minutes"] = week, {}
+        # `booked_holes` is cleared with the counter it guards: kept across the
+        # roll it would suppress a hole that this week has not yet counted.
+        state["week"], state["gap_minutes"], state["booked_holes"] = week, {}, {}
     events: list[tuple[str, str]] = []
     open_since: dict[str, float] = state.setdefault("open", {})
     # Accrue BEFORE processing edges, so the segment between the previous tick
@@ -260,20 +356,11 @@ def cmd_check() -> None:
         for name, (_, detail) in conds.items()
         if name.startswith(("unit:", "report:"))
     }
-    hole = capture_hole(state, now_s)
     events = tick(state, {k: v for k, v in conds.items() if not k.startswith("report:")}, now_s)
-    if hole:
-        start, end = hole
-        minutes = (end - start) / 60
-        span = " -> ".join(datetime.fromtimestamp(s, timezone.utc).strftime("%m-%d %H:%M:%SZ") for s in hole)
-        gaps = state.setdefault("gap_minutes", {})
-        gaps["stream:hl.trades:hole"] = gaps.get("stream:hl.trades:hole", 0.0) + minutes
-        state["holes"] = (state.get("holes") or [])[-19:] + [{"from_s": start, "to_s": end, "minutes": minutes}]
-        events.append(("open", f"CAPTURE HOLE {minutes:.0f}m ({span}): capture restarted while this watchdog "
-                               f"was silent; `nat2 audit feed` has the exact gap"))
-        state.setdefault("pending_incidents", []).append({
-            "name": "capture_hole", "from_ts": int(start * 1e9), "to_ts": int(end * 1e9), "minutes": minutes,
-            "cause": "capture unit restarted during watchdog silence (reboot or stop); tape mtimes + manifest"})
+    # After `tick`, because the week roll inside it clears both the counter and
+    # the dedupe set; booking first would credit the new week and then have the
+    # record of having done so wiped.
+    events += book_holes(state, now_s)
     state["pending_incidents"] = [p for p in state.get("pending_incidents", []) if not ledger_incident(p)][-20:]
     for kind, message in events:
         record_action(kind, message, now_s)

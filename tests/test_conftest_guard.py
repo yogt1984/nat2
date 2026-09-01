@@ -71,15 +71,16 @@ def test_a_rebound_helper_still_honours_an_explicit_argument(tmp_path):
 
 
 def test_the_helpers_that_were_rebound_are_exactly_the_ones_with_store_defaults():
-    """Five, not the four a hand-written list would have named: capture_hole also
-    defaults to TAPE_DIR (gapwatch.py:119), so without the rebinding it globs the
-    real 17k-file tape whenever a test calls it without a third argument. Deriving
-    the set from the signatures rather than listing it is what caught that."""
+    """Five, not the four a hand-written list would have named. Deriving the set
+    from the signatures rather than listing it is what caught the fifth -- and it
+    kept working when task 19 replaced `capture_hole` (defaulting to TAPE_DIR)
+    with `book_holes` (defaulting to MANIFEST and LEDGER). A hand-written list
+    would have silently stopped shielding the moment the function was renamed."""
     rebound = {name for name in dir(gapwatch)
                if hasattr(getattr(gapwatch, name), "__wrapped_defaults__")}
     assert rebound == {"newest_ingest", "tape_heartbeat_s", "last_observation_s",
-                       "record_action", "capture_hole"}
-    assert gapwatch.capture_hole({}, NOW) is None      # rebound default, no real tape reached
+                       "record_action", "book_holes"}
+    assert gapwatch.book_holes({}, NOW) == []          # rebound defaults, no real store reached
 
 
 def test_a_watchdog_event_is_written_to_the_scratch_log_not_the_real_one(tmp_path, monkeypatch):

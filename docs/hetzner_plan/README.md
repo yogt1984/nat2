@@ -28,7 +28,7 @@ Sources: the audited assessment, runbook and implementation specs
 | 11 | Capture startup retry (T1) | **done** |
 | 12 | Capture shared budget (T2) | **done** |
 | 13 | Capture disk-full (T3) | **done** |
-| 14 | Backup code (T13) | todo |
+| 14 | Backup code (T13) | **code done** |
 | 15 | Storage Box and restic | todo |
 | 16 | Caddy and DNS | todo |
 | 17 | External dead-man | todo |

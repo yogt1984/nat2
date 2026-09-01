@@ -228,3 +228,112 @@ def test_liqview_never_writes():
     opened = re.findall(r"""\.open\(\s*["']([^"']*)["']""", source)
     assert opened, "expected at least one open() to check"
     assert all(set(mode) <= {"r", "b", "t"} for mode in opened), f"write mode in {opened}"
+
+
+# --- the asymmetry strip (task 04) ------------------------------------------
+
+def _imb_store(tmp_path: Path, values: list[float]) -> Path:
+    for i, value in enumerate(values):
+        payload = {"coins": [{
+            "coin": "BTC", "mark": 100.0, "coverage": 0.38, "published_frac": 0.64,
+            "span": 0.30, "bucket_pct": 0.0025, "imb": {"0.01": value},
+            "buckets": [[0.0, 1_000_000.0, 0.0, 1]], "near": {},
+        }]}
+        with WormWriter(tmp_path, STREAM) as writer:
+            writer.write(payload, t_event=None, t_ingest=T0 + i * 60 * NS)
+    return tmp_path
+
+
+def test_the_strip_shows_which_side_the_mass_is_on(tmp_path):
+    _imb_store(tmp_path, [-0.9, -0.4, 0.0, 0.4, 0.9])
+    rows = liqview.snapshots("BTC", T0, T0 + 5 * 60 * NS, root=tmp_path)
+    (band, line), = liqview.imb_strip(rows, ["0.01"], width=5)
+    assert band == "0.01"
+    assert line == "Vv-^A", f"got {line!r}"
+
+
+def test_the_strip_is_column_aligned_with_the_heatmap(tmp_path):
+    """The whole value of the strip is reading it against the frame above it:
+    whether the lopsidedness came before the move or after."""
+    _imb_store(tmp_path, [0.9] * 30)
+    rows = liqview.snapshots("BTC", T0, T0 + 30 * 60 * NS, root=tmp_path)
+    art = liqview.render(rows, "absolute", 0.05, 8, 17, colour=False)
+    (_, line), = liqview.imb_strip(rows, ["0.01"], width=17)
+    assert len(line) == len(art.splitlines()[0].split("|", 1)[1])
+
+
+# --- realized liquidations (task 05) ----------------------------------------
+
+def _registry(tmp_path: Path, events: list[tuple[int, float, float, int]]) -> Path:
+    import sqlite3
+
+    db = tmp_path / "registry.sqlite"
+    with sqlite3.connect(db) as conn:
+        conn.execute("CREATE TABLE liquidations (tid INTEGER PRIMARY KEY, t_event INTEGER,"
+                     " coin TEXT, liquidated_user TEXT, mark_px REAL, method TEXT,"
+                     " px REAL, sz REAL, observer TEXT, source TEXT, t_ingest INTEGER)")
+        conn.executemany(
+            "INSERT INTO liquidations VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            [(i, t, "BTC", "0xa", px, "market", px, sz, "0xo", "counterparty", ingest)
+             for i, (t, px, sz, ingest) in enumerate(events)])
+    return db
+
+
+def test_liquidations_are_selected_by_event_time_not_arrival(tmp_path):
+    """The one that matters. BTC events land a median of 7 minutes after they
+    happen and up to an hour late; selected or placed by `t_ingest`, a cascade
+    appears AFTER the move that caused it and the frame invents causality
+    backwards."""
+    inside_late = (T0 + 60 * NS, 100.0, 1.0, T0 + 3600 * NS)     # happened in, arrived after
+    outside_early = (T0 - 3600 * NS, 100.0, 1.0, T0 + 120 * NS)  # happened before, arrived in
+    db = _registry(tmp_path, [inside_late, outside_early])
+
+    found = liqview.liquidations("BTC", T0, T0 + 600 * NS, db=db)
+    assert len(found) == 1, "selection must be on t_event"
+    assert found[0]["t"] == inside_late[0]
+    assert found[0]["late_s"] == pytest.approx(3540.0)
+
+
+def test_a_liquidation_is_drawn_at_the_price_it_happened(tmp_path):
+    _store(tmp_path, [(100.0, [[0.0, 1_000_000.0, 0.0, 1]]) for _ in range(8)])
+    rows = liqview.snapshots("BTC", T0, T0 + 8 * 60 * NS, root=tmp_path)
+    events = [{"t": rows[4]["t"], "px": 101.0, "notional": 5000.0, "method": "market",
+               "late_s": 10.0}]
+    art = liqview.render(rows, "absolute", 0.05, 20, 8, colour=False, events=events)
+    assert liqview.LIQ_SMALL in art or liqview.LIQ_LARGE in art
+    # the row it lands on must be above the mark row, since 101 > 100
+    lines = art.splitlines()
+    liq_row = next(i for i, l in enumerate(lines)
+                   if liqview.LIQ_SMALL in l or liqview.LIQ_LARGE in l)
+    mark_row = next(i for i, l in enumerate(lines) if liqview.MARK_GLYPH in l)
+    assert liq_row < mark_row, "a higher price must draw higher on the frame"
+
+
+def test_the_late_glyph_marks_the_window_not_the_column(tmp_path):
+    """Nearly every event is late by more than one column -- BTC averages 1,114 s
+    against ~145 s columns -- so a per-column test marks all of them and the
+    glyph says nothing. It marks events that arrived after the window closed."""
+    _store(tmp_path, [(100.0, [[0.0, 1_000_000.0, 0.0, 1]]) for _ in range(10)])
+    rows = liqview.snapshots("BTC", T0, T0 + 10 * 60 * NS, root=tmp_path)
+    window_s = (rows[-1]["t"] - rows[0]["t"]) / NS
+
+    ordinary = [{"t": rows[5]["t"], "px": 100.0, "notional": 1.0, "method": "m",
+                 "late_s": window_s / 2}]
+    beyond = [{"t": rows[5]["t"], "px": 100.0, "notional": 1.0, "method": "m",
+               "late_s": window_s * 2}]
+    assert liqview.LIQ_LATE not in liqview.render(rows, "absolute", 0.05, 12, 10,
+                                                  colour=False, events=ordinary)
+    assert liqview.LIQ_LATE in liqview.render(rows, "absolute", 0.05, 12, 10,
+                                              colour=False, events=beyond)
+
+
+def test_the_registry_is_opened_read_only(tmp_path):
+    db = _registry(tmp_path, [(T0 + 60 * NS, 100.0, 1.0, T0 + 90 * NS)])
+    liqview.liquidations("BTC", T0, T0 + 600 * NS, db=db)
+    source = (Path(__file__).resolve().parent.parent / "deploy" / "liqview.py").read_text()
+    assert "mode=ro" in source, "a live daemon owns the registry; this tool renders"
+
+
+def test_a_missing_registry_is_not_an_error(tmp_path):
+    # The tool must render on a box that has a tape but no registry yet.
+    assert liqview.liquidations("BTC", T0, T0 + 600 * NS, db=tmp_path / "absent.sqlite") == []

@@ -22,8 +22,8 @@ One file per unit of work, in execution order. Each states **what**, **how**,
 | 01 | The data slice | **done** |
 | 02 | Two views, and why the absolute one is the point | **done** |
 | 03 | The ASCII heatmap | **done** |
-| 04 | The price path and the asymmetry strip | todo |
-| 05 | Realized liquidations overlay | todo |
+| 04 | The price path and the asymmetry strip | **done** |
+| 05 | Realized liquidations overlay | **done** |
 | 06 | The CLI surface | partial |
 | 07 | Remote: check and fetch from the Hetzner box | todo |
 | 08 | Tests and verification | **done** |

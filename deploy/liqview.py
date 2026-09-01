@@ -45,6 +45,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 RAW = ROOT / "data" / "raw"
+REGISTRY = ROOT / "data" / "registry.sqlite"
 STREAM = "nat2.liqmap2"
 MANIFEST = "_manifest.jsonl"
 SUFFIX = ".ndjson.zst"
@@ -54,6 +55,14 @@ NS = 1_000_000_000
 # without pretending to a precision the eye cannot read.
 RAMP = " .:-=+*#%@"
 MARK_GLYPH = "o"
+# Signed, for the asymmetry strip: which side of price the mass sits on.
+IMB_RAMP = ("V", "v", "-", "^", "A")
+# Presentation only. These decide nothing -- they choose a character -- and they
+# are printed in the legend so nobody mistakes them for a signal. A threshold
+# that gates a decision goes on the ledger first; this one gates a glyph.
+IMB_MILD, IMB_STRONG = 0.20, 0.60
+LIQ_SMALL, LIQ_LARGE = "x", "X"
+LIQ_LATE = "!"
 # Batched so 360 snapshots are a few subprocesses rather than 360 of them.
 BATCH = 200
 
@@ -230,8 +239,9 @@ def _percentile(values: list[float], q: float) -> float:
 
 
 def render(rows: list[dict], view: str, span: float, height: int, width: int,
-           colour: bool) -> str:
+           colour: bool, events: list[dict] | None = None) -> str:
     cells, mark_row, lo, hi = grid(rows, view, span, height, width)
+    step = (hi - lo) / height if hi > lo else 1.0
     values = [v for line in cells for v in line if v > 0]
     peak = max(values, default=0.0)
     # Normalised across the log RANGE, not from zero. Dividing by log(peak)
@@ -248,6 +258,31 @@ def render(rows: list[dict], view: str, span: float, height: int, width: int,
     hi_log = math.log10(ceiling) if ceiling > floor else lo_log + 1.0
     width_log = (hi_log - lo_log) or 1.0
 
+    # Realized events, placed by event time and price on the same axes.
+    marks: dict[tuple[int, int], str] = {}
+    if events:
+        binned = columns(rows, width)
+        edges = [b[0]["t"] for b in binned]
+        big = _percentile(sorted(e["notional"] for e in events), 0.75)
+        # Against the WINDOW, not the column. Nearly every event is late by
+        # more than one column -- BTC averages 1,114 s and a column here is
+        # ~145 s -- so a per-column test marks all of them and the glyph says
+        # nothing. What matters is an event that arrived after the window it
+        # belongs to had already closed: that one was invisible to anyone
+        # watching live, and is the reason a frame redrawn tomorrow differs.
+        window_s = ((rows[-1]["t"] - rows[0]["t"]) / NS) or 1.0
+        for event in events:
+            x = max(0, min(len([e for e in edges if e <= event["t"]]) - 1, len(binned) - 1))
+            y = math.floor((event["px"] - lo) / step) if view == "absolute" else None
+            if y is None:
+                centre = binned[x][-1]["mark"]
+                y = math.floor(((event["px"] - centre) / centre - lo) / step)
+            if not (0 <= y < height):
+                continue
+            glyph = LIQ_LATE if event["late_s"] > window_s else (
+                LIQ_LARGE if event["notional"] >= big else LIQ_SMALL)
+            marks[(y, x)] = glyph
+
     out = []
     for y in range(height - 1, -1, -1):                     # price increases upward
         line = []
@@ -256,13 +291,69 @@ def render(rows: list[dict], view: str, span: float, height: int, width: int,
             if value > 0:
                 level = (math.log10(value) - lo_log) / width_log
                 glyph = RAMP[min(max(int(level * (len(RAMP) - 1)), 0), len(RAMP) - 1)]
-            if mark_row[x] == y:
+            if (y, x) in marks:
+                glyph = marks[(y, x)]
+            elif mark_row[x] == y:
                 glyph = f"\033[93m{MARK_GLYPH}\033[0m" if colour else MARK_GLYPH
             line.append(glyph)
         label = (hi - (hi - lo) * (height - 1 - y) / max(height - 1, 1))
         axis = f"{label:>10,.0f}" if view == "absolute" else f"{label * 100:>+9.1f}%"
         out.append(f"{axis} |{''.join(line)}")
     return "\n".join(out)
+
+
+def imb_strip(rows: list[dict], bands: list[str], width: int) -> list[tuple[str, str]]:
+    """One row per band: which way the map leans, over time.
+
+    `imb` is already on every snapshot, per band, so nothing is derived here --
+    it is read and drawn. The point is temporal ordering: whether the
+    lopsidedness came before the move or after it, which is the whole
+    difference between a magnet and a coincidence.
+    """
+    binned = columns(rows, width)
+    out = []
+    for band in bands:
+        line = []
+        for bucket in binned:
+            values = [b["imb"].get(band) for b in bucket if b["imb"].get(band) is not None]
+            if not values:
+                line.append(" ")
+                continue
+            value = sum(values) / len(values)
+            if abs(value) < IMB_MILD:
+                line.append(IMB_RAMP[2])
+            elif abs(value) < IMB_STRONG:
+                line.append(IMB_RAMP[3] if value > 0 else IMB_RAMP[1])
+            else:
+                line.append(IMB_RAMP[4] if value > 0 else IMB_RAMP[0])
+        out.append((band, "".join(line)))
+    return out
+
+
+def liquidations(coin: str, since_ns: int, until_ns: int,
+                 db: Path = REGISTRY) -> list[dict]:
+    """Realized liquidations in the window, by EVENT time.
+
+    Never by arrival: BTC events land 1,114 s late on average and 3,665 s at
+    worst on this box, so drawn by `t_ingest` a cascade appears after the move
+    that caused it and the picture invents causality backwards.
+
+    Opened read-only. A live daemon owns this file and this tool renders.
+    """
+    import sqlite3
+
+    if not db.exists():
+        return []
+    try:
+        with sqlite3.connect(f"file:{db}?mode=ro", uri=True) as conn:
+            rows = conn.execute(
+                "SELECT t_event, px, sz, method, t_ingest FROM liquidations"
+                " WHERE coin = ? AND t_event BETWEEN ? AND ? ORDER BY t_event",
+                (coin, since_ns, until_ns)).fetchall()
+    except sqlite3.Error:
+        return []
+    return [{"t": t, "px": px, "notional": (px or 0) * (sz or 0), "method": method,
+             "late_s": (ingest - t) / NS} for t, px, sz, method, ingest in rows]
 
 
 # --- framing ---------------------------------------------------------------
@@ -283,7 +374,8 @@ def iso(ns: int) -> str:
 
 
 def frame(rows: list[dict], coin: str, view: str, span: float, height: int,
-          width: int, colour: bool) -> str:
+          width: int, colour: bool, bands: list[str] | None = None,
+          events: list[dict] | None = None) -> str:
     first, last = rows[0], rows[-1]
     cells, _, _, _ = grid(rows, view, span, height, width)
     seen = [v for line in cells for v in line if v > 0]
@@ -293,12 +385,30 @@ def frame(rows: list[dict], coin: str, view: str, span: float, height: int,
             f"view={view} span=±{span * 100:.0f}%")
     qual = (f"coverage {last['coverage']:.3f}   published {last['published_frac']:.3f}   "
             f"bucket {last['bucket_pct'] * 100:.2f}%   mark {last['mark']:,.0f}")
-    body = render(rows, view, span, height, width, colour)
+    body = render(rows, view, span, height, width, colour, events)
+    if bands:
+        strip = imb_strip(rows, bands, width)
+        body += "\n" + "\n".join(f"{'imb ' + b:>10} |{line}" for b, line in strip)
     legend = (f"  '{RAMP.strip()}'  log scale, p20 ${floor:,.0f} .. p99 ${ceiling:,.0f} "
               f"per cell (peak ${peak:,.0f})   '{MARK_GLYPH}' = mark")
-    note = ("  the map is built from the wallets we can see; "
-            f"coverage {last['coverage']:.0%} of open interest")
-    return "\n".join([head, qual, "", body, "", legend, note])
+    lines = [head, qual, "", body, "", legend]
+    if bands:
+        lines.append(f"  imb '{IMB_RAMP[0]}{IMB_RAMP[1]}{IMB_RAMP[2]}{IMB_RAMP[3]}{IMB_RAMP[4]}'"
+                     f" = down .. balanced .. up (|imb| < {IMB_MILD} / < {IMB_STRONG};"
+                     " presentation, not a signal)")
+    if events is not None:
+        window_s = ((rows[-1]["t"] - rows[0]["t"]) / NS) or 1.0
+        beyond = sum(1 for e in events if e["late_s"] > window_s)
+        median_late = _percentile(sorted(e["late_s"] for e in events), 0.50)
+        lines.append(f"  '{LIQ_SMALL}/{LIQ_LARGE}' = realized liquidation (small/large), "
+                     f"'{LIQ_LATE}' arrived after this window closed")
+        lines.append(f"  {len(events)} observed, median arrival {median_late / 60:.0f} min "
+                     f"after the event, {beyond} later than the window itself")
+        lines.append("  observed liquidations, not all liquidations: liqscan reads userFills, "
+                     "capped at 2,000 per wallet")
+    lines.append("  the map is built from the wallets we can see; "
+                 f"coverage {last['coverage']:.0%} of open interest")
+    return "\n".join(lines)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -312,6 +422,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--rows", type=int, default=32)
     parser.add_argument("--width", type=int, default=0, help="0 = fit the terminal")
     parser.add_argument("--ascii", action="store_true", help="no colour")
+    parser.add_argument("--bands", default="",
+                        help="comma-separated imb bands to strip, e.g. 0.01,0.02,0.05")
+    parser.add_argument("--liquidations", action="store_true",
+                        help="overlay realized liquidations, placed by event time")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
 
@@ -330,7 +444,9 @@ def main(argv: list[str] | None = None) -> int:
 
     width = args.width or max(40, min(shutil.get_terminal_size((100, 24)).columns - 13, 220))
     colour = not args.ascii and sys.stdout.isatty()
-    print(frame(rows, args.coin, args.view, args.span, args.rows, width, colour))
+    bands = [b.strip() for b in args.bands.split(",") if b.strip()]
+    events = liquidations(args.coin, since, until) if args.liquidations else None
+    print(frame(rows, args.coin, args.view, args.span, args.rows, width, colour, bands, events))
     return 0
 
 

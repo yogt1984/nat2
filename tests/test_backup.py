@@ -275,3 +275,25 @@ def test_the_state_file_carries_an_age(tmp_path):
     backup.write_state({"ok": True, "matched": 20}, path=state)
     blob = json.loads(state.read_text())
     assert blob["ok"] is True and blob["matched"] == 20 and blob["t_ingest"] > 0
+
+
+def test_every_run_leaves_a_record_a_past_day_can_be_checked_against(tmp_path):
+    """`backup_state.json` is one overwritten record: each write erases the one
+    before it, so it can say when a backup last succeeded and never whether
+    2026-08-23 was ever covered. That second question is the only one task 20's
+    backup criterion asks, and without an append-only trail the answer changes
+    every time a backup runs."""
+    actions = tmp_path / "actions.jsonl"
+    backup.record_action("snapshot", {"ok": True, "keep_daily": 90}, actions=actions)
+    backup.record_action("verify", {"ok": True, "matched": 20}, actions=actions)
+
+    rows = [json.loads(line) for line in actions.read_text().splitlines()]
+    assert [r["kind"] for r in rows] == ["backup:snapshot", "backup:verify"]
+    assert all(r["level"] == "L0" and r["t_ingest"] > 0 for r in rows)
+    # Append-only: the first record survives the second.
+    assert rows[0]["payload"]["keep_daily"] == 90
+
+
+def test_bookkeeping_failure_does_not_fail_a_backup_that_ran(tmp_path):
+    # The record is evidence about the backup, not part of it.
+    backup.record_action("stage", {"ok": True}, actions=tmp_path / "nope" / "x" / "a.jsonl")

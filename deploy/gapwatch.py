@@ -181,6 +181,17 @@ def book_holes(state: dict, now_s: float, manifest: Path = MANIFEST,
     watchdog carries on watching: refusing to run would blind the only alarm
     over a number that governs bookkeeping.
     """
+    # Drop hole keys for streams that are no longer booked. The snapshot
+    # streams were briefly booked by an earlier version of this function, and
+    # left 2,771.9 phantom minutes in the W36 counter against a 60-minute
+    # budget -- a number the status page and the digest were both reporting.
+    # Pruning here rather than by hand because the same thing happens to any
+    # week that straddles a change in which streams are booked.
+    gaps = state.get("gap_minutes") or {}
+    for key in [k for k in gaps if k.endswith(":hole")
+                and k.removeprefix("stream:").removesuffix(":hole") not in CONTINUOUS]:
+        del gaps[key]
+
     floor = preregistered_floor(ledger)
     if floor is None:
         return []

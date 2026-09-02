@@ -220,3 +220,20 @@ def test_hole_is_alerted_once_counted_and_ledgered_with_retry(tmp_path, monkeypa
     gapwatch.cmd_check()
     state = json.loads((tmp_path / "state.json").read_text())
     assert state["pending_incidents"] == [] and len(ledgered) == 2 and len(sent) == 1       # retried once, no second alert
+
+
+def test_hole_keys_for_streams_that_are_no_longer_booked_are_pruned(tmp_path):
+    """A week that straddles a change in which streams are booked keeps counting
+    the old ones. When booking was scoped to CONTINUOUS, the snapshot streams
+    left 2,771.9 phantom minutes in the live W36 counter -- against a 60-minute
+    budget -- and both the status page and the digest were reporting it."""
+    manifest, ledger = _manifest_with_hole(tmp_path, NOW)
+    state = {"gap_minutes": {"stream:nat2.liqmap:hole": 2771.9,     # booked by older code
+                             "stream:nat2.liqmap": 5.0,             # staleness, still legitimate
+                             "stream:hl.trades:hole": 12.0}}
+    gapwatch.book_holes(state, NOW, manifest=manifest, ledger=ledger)
+
+    gaps = state["gap_minutes"]
+    assert "stream:nat2.liqmap:hole" not in gaps
+    assert gaps["stream:nat2.liqmap"] == 5.0, "the staleness key is not a hole key"
+    assert gaps["stream:hl.trades:hole"] >= 12.0

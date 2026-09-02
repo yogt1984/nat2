@@ -57,6 +57,11 @@ RAW = DATA / "raw"
 LEDGER = DATA / "ledger.jsonl"
 STAGED = DATA / "ops" / "staged"
 STATE = DATA / "ops" / "backup_state.json"
+# Append-only, because the state file is one overwritten record and cannot say
+# whether a PAST day was ever covered -- which is the only question task 20's
+# backup criterion asks. Same shape as io/actions.py, written directly because
+# this file is stdlib-only.
+ACTIONS = DATA / "actions.jsonl"
 MANIFEST = "_manifest.jsonl"
 SUFFIX = ".ndjson.zst"
 NS = 1_000_000_000
@@ -289,6 +294,20 @@ def restore_verify(restored: Path, n: int, seed: int | None = None) -> dict:
 
 # --- state -----------------------------------------------------------------
 
+def record_action(kind: str, payload: dict, actions: Path = ACTIONS) -> None:
+    """One L0 line per run. The state file answers "when did a backup last
+    succeed"; this answers "was 2026-08-23 ever covered", which the state file
+    structurally cannot, because each write erases the one before it."""
+    try:
+        actions.parent.mkdir(parents=True, exist_ok=True)
+        record = {"t_ingest": int(datetime.now(timezone.utc).timestamp() * NS),
+                  "level": "L0", "kind": f"backup:{kind}", "payload": payload}
+        with actions.open("a") as fh:
+            fh.write(json.dumps(record, separators=(",", ":"), default=str) + "\n")
+    except OSError:
+        pass                       # a backup that ran must not fail on its own bookkeeping
+
+
 def write_state(result: dict, path: Path = STATE) -> None:
     """The sidecar the digest and the status page read, so `backup: none
     configured` can become a number with an age on it."""
@@ -360,6 +379,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "stage":
         staged = stage()
         write_state({"staged": staged, "ok": bool(staged)})
+        record_action("stage", {"ok": bool(staged), "files": sorted(staged)})
         for name, info in staged.items():
             print(f"staged {name}: {info['bytes']:,} bytes  {info['sha256'][:16]}...")
         return 0 if staged else 1
@@ -368,11 +388,14 @@ def main(argv: list[str] | None = None) -> int:
         stage()
         result = snapshot(policy["keep_daily"], dry_run=args.dry_run)
         write_state({"snapshot": result, "ok": result["ok"]})
+        record_action("snapshot", {"ok": result["ok"], "keep_daily": policy["keep_daily"]})
         print(json.dumps(result, indent=2))
         return 0 if result["ok"] else 1
 
     result = restore_verify(args.restored, policy["spot_check_n"], seed=args.seed)
     write_state({"verify": result, "ok": result["ok"]})
+    record_action("verify", {"ok": result["ok"], "matched": result["matched"],
+                             "sampled": result["sampled"], "chain_ok": result["chain_ok"]})
     print(f"{result['matched']}/{result['sampled']} parts match their sha256 "
           f"across {len(result['per_stream'])} streams {result['per_stream']}")
     print(f"ledger: {result['chain']}")

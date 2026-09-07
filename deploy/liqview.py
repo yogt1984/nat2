@@ -186,6 +186,12 @@ def snapshots(coin: str, since_ns: int, until_ns: int, root: Path = RAW) -> list
                 "published_frac": entry.get("published_frac"),
                 "buckets": entry.get("buckets") or [], "imb": entry.get("imb") or {},
                 "span": entry.get("span"), "bucket_pct": entry.get("bucket_pct"),
+                # Projected for `tools/liqfig.py`, which stamps them on every figure:
+                # about half of BTC's mapped positions sit outside the ±30% span, so a
+                # picture that omits the count overstates what it is showing. Unused
+                # here -- the terminal frame has no room -- and additive, so nothing
+                # downstream of `snapshots()` changes.
+                "positions": entry.get("positions"), "outside_span": entry.get("outside_span"),
             })
     rows.sort(key=lambda r: r["t"])
     return rows

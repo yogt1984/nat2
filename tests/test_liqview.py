@@ -176,10 +176,14 @@ def test_the_ramp_does_not_saturate_on_a_decade_spanning_bulk(tmp_path):
     art = liqview.render(rows, "relative", 0.08, 24, 30, colour=False)
     idx = [liqview.RAMP.index(c) for c in art if c in liqview.RAMP.strip()]
     assert idx, "nothing rendered"
+    # Re-measured when the ramp went from nine steps to five: the fixed scale
+    # uses all five with a median index of 2.5, the saturating one collapses to
+    # two with a median of 4.0. Both bounds sit between those, so each still
+    # discriminates -- checked by reverting the scale, not by assuming.
     median = statistics.median(idx)
-    assert median <= 6.0, (
+    assert median <= 3.0, (
         f"the ramp saturated: median glyph index {median} of {len(liqview.RAMP) - 1}")
-    assert len(set(idx)) >= 8, f"the ramp must use its range, got {len(set(idx))} levels"
+    assert len(set(idx)) >= 4, f"the ramp must use its range, got {len(set(idx))} levels"
 
 
 # --- the frame --------------------------------------------------------------

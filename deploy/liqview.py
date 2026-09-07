@@ -199,24 +199,102 @@ def snapshots(coin: str, since_ns: int, until_ns: int, root: Path = RAW) -> list
 
 # --- the grid --------------------------------------------------------------
 
-def columns(rows: list[dict], width: int) -> list[list[dict]]:
-    """Snapshots binned into terminal columns, oldest left."""
-    if len(rows) <= width:
-        return [[r] for r in rows]
-    per = len(rows) / width
-    out: list[list[dict]] = [[] for _ in range(width)]
-    for i, row in enumerate(rows):
-        out[min(int(i / per), width - 1)].append(row)
-    return [c for c in out if c]
+def columns(rows: list[dict], width: int,
+            window: tuple[int, int] | None = None) -> list[list[dict]]:
+    """Snapshots binned into terminal columns, oldest left.
+
+    Binned by TIME, not by snapshot index, whenever the window is known. Index
+    binning made every column carry the same number of snapshots, which silently
+    closed up the gaps: a 23.7 h hole in the tape drew as one narrow seam
+    between two dense columns, and the x axis had no scale at all. Time binning
+    gives every column the same duration -- so a column is a unit that can be
+    printed in the header -- and leaves a hole in the tape as blank columns,
+    which is what it is. Empty buckets are KEPT, so the frame always spans the
+    full window and always fills the width.
+    """
+    if window is None:                                      # legacy: index bins
+        if len(rows) <= width:
+            return [[r] for r in rows]
+        per = len(rows) / width
+        out: list[list[dict]] = [[] for _ in range(width)]
+        for i, row in enumerate(rows):
+            out[min(int(i / per), width - 1)].append(row)
+        return [c for c in out if c]
+    since, until = window
+    span = (until - since) or 1
+    out = [[] for _ in range(width)]
+    for row in rows:
+        x = min(max((row["t"] - since) * width // span, 0), width - 1)
+        out[x].append(row)
+    return out
 
 
-def grid(rows: list[dict], view: str, span: float, height: int, width: int):
+# Measured on su-35: 13.6 MB of hl.liqmap2 parts decompress and parse in 5.6 s.
+# Every part holds all ~176 coins and we keep one, so the cost is bytes on disk,
+# not snapshots kept. Conservative on purpose -- overestimating trims the window
+# and says so, underestimating hangs the terminal for minutes with no warning.
+SCAN_MB_S = 2.4
+
+
+def part_span(stream: str, since_ns: int, until_ns: int,
+              root: Path = RAW) -> list[tuple[int, int]]:
+    """`(first_ingest, bytes)` per part in the window, oldest first."""
+    claimed, out = set(), []
+    for entry in read_manifest(root):
+        if entry.get("stream") != stream:
+            continue
+        claimed.add(entry["path"])
+        if entry["last_ingest"] >= since_ns and entry["first_ingest"] <= until_ns:
+            path = root / entry["path"]
+            if path.exists():
+                out.append((entry["first_ingest"], path.stat().st_size))
+    directory = root / stream
+    if directory.exists():
+        for part in directory.rglob(f"*{SUFFIX}"):
+            if str(part.relative_to(root)) in claimed:
+                continue
+            stat = part.stat()
+            if stat.st_mtime * NS >= since_ns:
+                out.append((int(stat.st_mtime * NS), stat.st_size))
+    return sorted(out)
+
+
+def budget_window(since_ns: int, until_ns: int, budget_s: float,
+                  root: Path = RAW) -> tuple[int, float, float]:
+    """`(since, full_cost_s, kept_cost_s)` -- the widest window inside the budget.
+
+    Walks the parts newest-first, accumulating bytes, and stops when the
+    estimated scan would blow the budget. Returns the original `since` when the
+    whole window fits, so the common case is untouched. The floor is a part's
+    own `first_ingest`, never a part COUNT scaled by an assumed cadence -- parts
+    run ~34/hour here, not one, and that assumption made the trim a no-op.
+    """
+    parts = part_span(STREAM, since_ns, until_ns, root)
+    full = sum(n for _, n in parts) / 1e6 / SCAN_MB_S
+    if budget_s <= 0 or full <= budget_s or not parts:
+        return since_ns, full, full
+    mb, floor = 0.0, parts[-1][0]
+    for first, size in reversed(parts):
+        if (mb + size / 1e6) / SCAN_MB_S > budget_s:
+            break
+        mb += size / 1e6
+        floor = first
+    return max(since_ns, floor), full, mb / SCAN_MB_S
+
+
+def col_seconds(window: tuple[int, int], width: int) -> float:
+    """Wall-clock seconds one character column stands for."""
+    return (window[1] - window[0]) / NS / max(width, 1)
+
+
+def grid(rows: list[dict], view: str, span: float, height: int, width: int,
+         window: tuple[int, int] | None = None):
     """`(cells, mark_row, axis_lo, axis_hi)`.
 
     Absolute: the y axis is price and a cluster sits still. Relative: the y axis
     is distance from mark and price is the centre line.
     """
-    binned = columns(rows, width)
+    binned = columns(rows, width, window)
     if view == "absolute":
         marks = [r["mark"] for r in rows]
         lo, hi = min(marks) * (1 - span), max(marks) * (1 + span)
@@ -227,6 +305,9 @@ def grid(rows: list[dict], view: str, span: float, height: int, width: int):
     cells = [[0.0] * len(binned) for _ in range(height)]
     mark_row = []
     for x, bucket in enumerate(binned):
+        if not bucket:                                      # a hole in the tape
+            mark_row.append(None)
+            continue
         for row in bucket:
             for entry in row["buckets"]:
                 lo_pct, notional = entry[0], entry[1]
@@ -254,10 +335,11 @@ def _percentile(values: list[float], q: float) -> float:
 
 
 def render(rows: list[dict], view: str, span: float, height: int, width: int,
-           colour: bool, events: list[dict] | None = None, ascii_only: bool = False) -> str:
+           colour: bool, events: list[dict] | None = None, ascii_only: bool = False,
+           window: tuple[int, int] | None = None) -> str:
     ramp = RAMP_ASCII if ascii_only else RAMP
     mark = MARK_ASCII if ascii_only else MARK_GLYPH
-    cells, mark_row, lo, hi = grid(rows, view, span, height, width)
+    cells, mark_row, lo, hi = grid(rows, view, span, height, width, window)
     step = (hi - lo) / height if hi > lo else 1.0
     values = [v for line in cells for v in line if v > 0]
     peak = max(values, default=0.0)
@@ -278,8 +360,8 @@ def render(rows: list[dict], view: str, span: float, height: int, width: int,
     # Realized events, placed by event time and price on the same axes.
     marks: dict[tuple[int, int], str] = {}
     if events:
-        binned = columns(rows, width)
-        edges = [b[0]["t"] for b in binned]
+        binned = columns(rows, width, window)
+        edges = [b[0]["t"] for b in binned if b]
         big = _percentile(sorted(e["notional"] for e in events), 0.75)
         # Against the WINDOW, not the column. Nearly every event is late by
         # more than one column -- BTC averages 1,114 s and a column here is
@@ -292,7 +374,10 @@ def render(rows: list[dict], view: str, span: float, height: int, width: int,
             x = max(0, min(len([e for e in edges if e <= event["t"]]) - 1, len(binned) - 1))
             y = math.floor((event["px"] - lo) / step) if view == "absolute" else None
             if y is None:
-                centre = binned[x][-1]["mark"]
+                near = [b for b in binned[x:] + binned[:x] if b]
+                if not near:
+                    continue
+                centre = near[0][-1]["mark"]
                 y = math.floor(((event["px"] - centre) / centre - lo) / step)
             if not (0 <= y < height):
                 continue
@@ -319,7 +404,8 @@ def render(rows: list[dict], view: str, span: float, height: int, width: int,
     return "\n".join(out)
 
 
-def imb_strip(rows: list[dict], bands: list[str], width: int) -> list[tuple[str, str]]:
+def imb_strip(rows: list[dict], bands: list[str], width: int,
+              window: tuple[int, int] | None = None) -> list[tuple[str, str]]:
     """One row per band: which way the map leans, over time.
 
     `imb` is already on every snapshot, per band, so nothing is derived here --
@@ -327,7 +413,7 @@ def imb_strip(rows: list[dict], bands: list[str], width: int) -> list[tuple[str,
     lopsidedness came before the move or after it, which is the whole
     difference between a magnet and a coincidence.
     """
-    binned = columns(rows, width)
+    binned = columns(rows, width, window)
     out = []
     for band in bands:
         line = []
@@ -397,28 +483,47 @@ def iso(ns: int) -> str:
     return datetime.fromtimestamp(ns / NS, timezone.utc).strftime("%m-%d %H:%M:%SZ")
 
 
+def human_s(seconds: float) -> str:
+    if seconds < 90:
+        return f"{seconds:.0f} s"
+    if seconds < 5400:
+        return f"{seconds / 60:.1f} min"
+    if seconds < 172800:
+        return f"{seconds / 3600:.1f} h"
+    return f"{seconds / 86400:.1f} d"
+
+
 def frame(rows: list[dict], coin: str, view: str, span: float, height: int,
           width: int, colour: bool, bands: list[str] | None = None,
-          events: list[dict] | None = None, ascii_only: bool = False) -> str:
+          events: list[dict] | None = None, ascii_only: bool = False,
+          window: tuple[int, int] | None = None) -> str:
     first, last = rows[0], rows[-1]
-    cells, _, _, _ = grid(rows, view, span, height, width)
+    window = window or (first["t"], last["t"])
+    cells, _, _, _ = grid(rows, view, span, height, width, window)
     seen = [v for line in cells for v in line if v > 0]
     peak = max(seen, default=0.0)
     floor, ceiling = _percentile(seen, 0.20), _percentile(seen, 0.99)
-    head = (f"{coin}  {iso(first['t'])} -> {iso(last['t'])}  {len(rows)} snapshots  "
+    per_col = col_seconds(window, width)
+    filled = sum(1 for b in columns(rows, width, window) if b)
+    head = (f"{coin}  {iso(window[0])} -> {iso(window[1])}  "
+            f"{human_s((window[1] - window[0]) / NS)} in {width} cols  "
             f"view={view} span=±{span * 100:.0f}%")
+    scale = (f"resolution {human_s(per_col)} per column   {len(rows)} snapshots   "
+             f"{filled}/{width} columns carry data"
+             + (f"   {width - filled} blank = no snapshot in that slice"
+                if filled < width else ""))
     qual = (f"coverage {last['coverage']:.3f}   published {last['published_frac']:.3f}   "
             f"bucket {last['bucket_pct'] * 100:.2f}%   mark {last['mark']:,.0f}")
-    body = render(rows, view, span, height, width, colour, events, ascii_only)
+    body = render(rows, view, span, height, width, colour, events, ascii_only, window)
     if bands:
-        strip = imb_strip(rows, bands, width)
+        strip = imb_strip(rows, bands, width, window)
         body += "\n" + "\n".join(f"{'imb ' + b:>10} |{line}" for b, line in strip)
     ramp = RAMP_ASCII if ascii_only else RAMP
     mark = MARK_ASCII if ascii_only else MARK_GLYPH
     legend = (f"  '{ramp.strip()}' sparse..dense, log scale: "
               f"${floor:,.0f} .. ${ceiling:,.0f} per cell (peak ${peak:,.0f})   "
               f"'{mark}' = price")
-    lines = [head, qual, "", body, "", legend]
+    lines = [head, scale, qual, "", body, "", legend]
     if bands:
         lines.append(f"  imb '{IMB_RAMP[0]}{IMB_RAMP[1]}{IMB_RAMP[2]}{IMB_RAMP[3]}{IMB_RAMP[4]}'"
                      f" = down .. balanced .. up (|imb| < {IMB_MILD} / < {IMB_STRONG};"
@@ -441,13 +546,13 @@ def frame(rows: list[dict], coin: str, view: str, span: float, height: int,
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="liquidation map over time, in the terminal")
     parser.add_argument("--coin", required=True)
-    parser.add_argument("--since", default="6h",
-                        help="window back from now, or 'max' for everything on disk")
+    parser.add_argument("--since", default="max",
+                        help="window back from now; default 'max' = everything on disk")
     parser.add_argument("--until", default=None)
     parser.add_argument("--view", choices=("absolute", "relative"), default="absolute")
     parser.add_argument("--span", type=float, default=0.05,
                         help="half-height of the price axis as a fraction of mark")
-    parser.add_argument("--rows", type=int, default=32)
+    parser.add_argument("--rows", type=int, default=0, help="0 = fit the terminal")
     parser.add_argument("--width", type=int, default=0, help="0 = fit the terminal")
     parser.add_argument("--ascii", action="store_true",
                         help="digits instead of blocks, and no colour; for pipes and notes")
@@ -455,6 +560,9 @@ def main(argv: list[str] | None = None) -> int:
                         help="comma-separated imb bands to strip, e.g. 0.01,0.02,0.05")
     parser.add_argument("--liquidations", action="store_true",
                         help="overlay realized liquidations, placed by event time")
+    parser.add_argument("--budget", type=float, default=45.0,
+                        help="seconds of scanning to spend; 0 = no limit. A window "
+                             "that would cost more is trimmed, and the frame says so")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
 
@@ -473,6 +581,9 @@ def main(argv: list[str] | None = None) -> int:
         # look like absent clusters rather than absent data.
         clamped = floor_ns is not None and since < floor_ns
         since = max(since, floor_ns) if floor_ns is not None else since
+    asked_since = since
+    since, full_cost, kept_cost = budget_window(since, until, args.budget)
+    trimmed = since > asked_since
     rows = snapshots(args.coin, since, until)
     if not rows:
         print(f"no {STREAM} snapshots for {args.coin} in {iso(since)} -> {iso(until)}",
@@ -483,14 +594,24 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(rows, separators=(",", ":")))
         return 0
 
-    width = args.width or max(40, min(shutil.get_terminal_size((100, 24)).columns - 13, 220))
+    term = shutil.get_terminal_size((100, 40))
+    width = args.width or max(40, min(term.columns - 13, 220))
+    # Fill the display: the axis, the two header lines, the blanks, the legend
+    # and the notes are the fixed cost; everything else is price rows.
+    height = args.rows or max(8, term.lines - (12 + len(
+        [b for b in args.bands.split(",") if b.strip()])))
     colour = not args.ascii and sys.stdout.isatty()
     bands = [b.strip() for b in args.bands.split(",") if b.strip()]
     events = liquidations(args.coin, since, until) if args.liquidations else None
     if clamped:
-        print(f"  (asked for more history than exists; clamped to {iso(since)})")
-    print(frame(rows, args.coin, args.view, args.span, args.rows, width, colour, bands,
-                events, ascii_only=args.ascii))
+        print(f"  (asked for more history than exists; clamped to {iso(asked_since)})")
+    if trimmed:
+        print(f"  (the full window back to {iso(asked_since)} would take ~{full_cost:.0f} s "
+              f"to scan, over the {args.budget:.0f} s budget; showing the last "
+              f"{(until - since) / NS / 3600:.1f} h at ~{kept_cost:.0f} s. "
+              f"--budget 0 renders all of it)")
+    print(frame(rows, args.coin, args.view, args.span, height, width, colour, bands,
+                events, ascii_only=args.ascii, window=(since, until)))
     return 0
 
 

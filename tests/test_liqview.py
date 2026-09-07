@@ -341,3 +341,95 @@ def test_the_registry_is_opened_read_only(tmp_path):
 def test_a_missing_registry_is_not_an_error(tmp_path):
     # The tool must render on a box that has a tape but no registry yet.
     assert liqview.liquidations("BTC", T0, T0 + 600 * NS, db=tmp_path / "absent.sqlite") == []
+
+
+# --- the x axis has a scale --------------------------------------------------
+
+def _gapped(tmp_path, before: int = 5, gap_min: int = 240, after: int = 5) -> tuple[Path, int, int]:
+    """Snapshots, a long hole, then snapshots again — the shape the tape
+    actually has: liqmap2 lost 23.7 h on 2026-09-06 and the frame drew it as a
+    seam one character wide between two dense blocks."""
+    t = T0
+    stamps = [T0 + i * 60 * NS for i in range(before)]
+    resume = stamps[-1] + gap_min * 60 * NS
+    stamps += [resume + i * 60 * NS for i in range(after)]
+    for stamp in stamps:
+        with WormWriter(tmp_path, STREAM) as writer:
+            writer.write(_snapshot(100.0, [[0.02, 1_000_000.0, 0.0, 3]]),
+                         t_event=None, t_ingest=stamp)
+    return tmp_path, stamps[0], stamps[-1]
+
+
+def test_a_hole_in_the_tape_is_blank_columns_not_a_closed_seam(tmp_path):
+    """Index binning gave every column the same snapshot COUNT, so a four-hour
+    hole between ten snapshots vanished: the frame showed ten adjacent columns
+    and claimed to cover four hours. Time binning leaves the hole where it is."""
+    root, first, last = _gapped(tmp_path)
+    rows = liqview.snapshots("BTC", first, last, root=root)
+    assert len(rows) == 10
+    binned = liqview.columns(rows, 40, (first, last))
+    assert len(binned) == 40                                # the width is filled
+    blank = [i for i, b in enumerate(binned) if not b]
+    assert len(blank) > 25, "the hole must occupy most of the frame"
+    assert binned[0] and binned[-1], "both ends carry data"
+    # And the failure this replaced, pinned: index binning packs the same ten
+    # snapshots into ten adjacent columns and the hole is gone from the picture.
+    legacy = liqview.columns(rows, 40)
+    assert len(legacy) == 10 and all(legacy), "index binning closes the seam"
+
+
+def test_the_header_states_seconds_per_column_and_how_many_are_blank(tmp_path):
+    root, first, last = _gapped(tmp_path)
+    rows = liqview.snapshots("BTC", first, last, root=root)
+    frame = liqview.frame(rows, "BTC", "absolute", 0.05, 10, 40, colour=False,
+                          window=(first, last))
+    assert "resolution" in frame and "per column" in frame
+    assert "/40 columns carry data" in frame
+    assert "blank = no snapshot" in frame
+    # 4.15 h over 40 columns is 6.2 min each; the number must be the real one.
+    assert f"{liqview.col_seconds((first, last), 40) / 60:.1f} min" in frame
+
+
+def test_the_mark_row_does_not_carry_across_a_hole(tmp_path):
+    """A gap column has no mark. Repeating the last one would draw a flat price
+    line through hours nobody observed."""
+    root, first, last = _gapped(tmp_path)
+    rows = liqview.snapshots("BTC", first, last, root=root)
+    _, mark_row, _, _ = liqview.grid(rows, "absolute", 0.05, 10, 40, (first, last))
+    assert mark_row.count(None) > 25
+
+
+def test_the_strip_stays_aligned_when_columns_are_time_binned(tmp_path):
+    root, first, last = _gapped(tmp_path)
+    rows = liqview.snapshots("BTC", first, last, root=root)
+    (band, line), = liqview.imb_strip(rows, ["0.01"], 40, (first, last))
+    assert len(line) == 40
+    body = liqview.render(rows, "absolute", 0.05, 10, 40, colour=False,
+                          window=(first, last))
+    for y, text in enumerate(body.splitlines()):
+        assert len(text.split("|", 1)[1]) == 40
+
+
+def test_the_budget_trims_by_ingest_time_not_by_part_count(tmp_path):
+    """The first cut computed the floor as `until - kept_parts * 1 h`, which
+    assumed one part per hour. The live store writes ~34, so the estimate put
+    the floor days before the tape and trimmed nothing at all — the frame took
+    three minutes with no warning."""
+    root, first, last = _gapped(tmp_path, before=30, gap_min=0, after=0)
+    parts = liqview.part_span(STREAM, first, last, root=root)
+    assert len(parts) > 10
+    total_mb = sum(n for _, n in parts) / 1e6
+    budget = (total_mb / liqview.SCAN_MB_S) / 3                # room for a third
+    floor, full, kept = liqview.budget_window(first, last, budget, root=root)
+    assert floor > first, "the window must actually be trimmed"
+    assert floor <= last
+    assert kept <= budget and kept < full
+    assert floor in {t for t, _ in parts}, "the floor is a real part's first ingest"
+
+
+def test_a_window_inside_the_budget_is_left_alone(tmp_path):
+    root, first, last = _gapped(tmp_path, before=5, gap_min=0, after=0)
+    floor, full, kept = liqview.budget_window(first, last, 1e6, root=root)
+    assert floor == first and kept == full
+    floor, _, _ = liqview.budget_window(first, last, 0.0, root=root)
+    assert floor == first, "--budget 0 means no limit"

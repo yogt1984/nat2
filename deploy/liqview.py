@@ -53,8 +53,17 @@ NS = 1_000_000_000
 
 # Densest last. Ten levels is what a log scale over four decades can carry
 # without pretending to a precision the eye cannot read.
-RAMP = " .:-=+*#%@"
-MARK_GLYPH = "o"
+# Five levels, not nine. Shade blocks come in three plus a full block, and a
+# ramp with more steps than the eye can rank is precision theatre: the previous
+# " .:-=+*#%@" could not be read without the legend, because `-`, `=` and `+`
+# look directional and `#`, `%`, `@` do not order against each other at all.
+RAMP = " ·░▒▓█"
+MARK_GLYPH = "◆"
+# For pipes, notes and anywhere a block might not render. Digits carry their own
+# ordering, so the legend is optional rather than load-bearing.
+RAMP_ASCII = " 12345"
+MARK_ASCII = "o"
+
 # Signed, for the asymmetry strip: which side of price the mass sits on.
 IMB_RAMP = ("V", "v", "-", "^", "A")
 # Presentation only. These decide nothing -- they choose a character -- and they
@@ -177,6 +186,12 @@ def snapshots(coin: str, since_ns: int, until_ns: int, root: Path = RAW) -> list
                 "published_frac": entry.get("published_frac"),
                 "buckets": entry.get("buckets") or [], "imb": entry.get("imb") or {},
                 "span": entry.get("span"), "bucket_pct": entry.get("bucket_pct"),
+                # Projected for `tools/liqfig.py`, which stamps them on every figure:
+                # about half of BTC's mapped positions sit outside the ±30% span, so a
+                # picture that omits the count overstates what it is showing. Unused
+                # here -- the terminal frame has no room -- and additive, so nothing
+                # downstream of `snapshots()` changes.
+                "positions": entry.get("positions"), "outside_span": entry.get("outside_span"),
             })
     rows.sort(key=lambda r: r["t"])
     return rows
@@ -239,7 +254,9 @@ def _percentile(values: list[float], q: float) -> float:
 
 
 def render(rows: list[dict], view: str, span: float, height: int, width: int,
-           colour: bool, events: list[dict] | None = None) -> str:
+           colour: bool, events: list[dict] | None = None, ascii_only: bool = False) -> str:
+    ramp = RAMP_ASCII if ascii_only else RAMP
+    mark = MARK_ASCII if ascii_only else MARK_GLYPH
     cells, mark_row, lo, hi = grid(rows, view, span, height, width)
     step = (hi - lo) / height if hi > lo else 1.0
     values = [v for line in cells for v in line if v > 0]
@@ -290,11 +307,11 @@ def render(rows: list[dict], view: str, span: float, height: int, width: int,
             glyph = " "
             if value > 0:
                 level = (math.log10(value) - lo_log) / width_log
-                glyph = RAMP[min(max(int(level * (len(RAMP) - 1)), 0), len(RAMP) - 1)]
+                glyph = ramp[min(max(int(level * (len(ramp) - 1)), 0), len(ramp) - 1)]
             if (y, x) in marks:
                 glyph = marks[(y, x)]
             elif mark_row[x] == y:
-                glyph = f"\033[93m{MARK_GLYPH}\033[0m" if colour else MARK_GLYPH
+                glyph = f"\033[93m{mark}\033[0m" if colour else mark
             line.append(glyph)
         label = (hi - (hi - lo) * (height - 1 - y) / max(height - 1, 1))
         axis = f"{label:>10,.0f}" if view == "absolute" else f"{label * 100:>+9.1f}%"
@@ -358,6 +375,13 @@ def liquidations(coin: str, since_ns: int, until_ns: int,
 
 # --- framing ---------------------------------------------------------------
 
+def earliest_ns(stream: str = STREAM, root: Path = RAW) -> int | None:
+    """When this stream's history starts. Asking for more than exists should
+    clamp and say so, not render an empty frame that reads as 'no clusters'."""
+    starts = [e["first_ingest"] for e in read_manifest(root) if e.get("stream") == stream]
+    return min(starts) if starts else None
+
+
 def parse_when(text: str, now_ns: int) -> int:
     match = re.fullmatch(r"(\d+(?:\.\d+)?)([smhdw])", text.strip())
     if match:
@@ -375,7 +399,7 @@ def iso(ns: int) -> str:
 
 def frame(rows: list[dict], coin: str, view: str, span: float, height: int,
           width: int, colour: bool, bands: list[str] | None = None,
-          events: list[dict] | None = None) -> str:
+          events: list[dict] | None = None, ascii_only: bool = False) -> str:
     first, last = rows[0], rows[-1]
     cells, _, _, _ = grid(rows, view, span, height, width)
     seen = [v for line in cells for v in line if v > 0]
@@ -385,12 +409,15 @@ def frame(rows: list[dict], coin: str, view: str, span: float, height: int,
             f"view={view} span=±{span * 100:.0f}%")
     qual = (f"coverage {last['coverage']:.3f}   published {last['published_frac']:.3f}   "
             f"bucket {last['bucket_pct'] * 100:.2f}%   mark {last['mark']:,.0f}")
-    body = render(rows, view, span, height, width, colour, events)
+    body = render(rows, view, span, height, width, colour, events, ascii_only)
     if bands:
         strip = imb_strip(rows, bands, width)
         body += "\n" + "\n".join(f"{'imb ' + b:>10} |{line}" for b, line in strip)
-    legend = (f"  '{RAMP.strip()}'  log scale, p20 ${floor:,.0f} .. p99 ${ceiling:,.0f} "
-              f"per cell (peak ${peak:,.0f})   '{MARK_GLYPH}' = mark")
+    ramp = RAMP_ASCII if ascii_only else RAMP
+    mark = MARK_ASCII if ascii_only else MARK_GLYPH
+    legend = (f"  '{ramp.strip()}' sparse..dense, log scale: "
+              f"${floor:,.0f} .. ${ceiling:,.0f} per cell (peak ${peak:,.0f})   "
+              f"'{mark}' = price")
     lines = [head, qual, "", body, "", legend]
     if bands:
         lines.append(f"  imb '{IMB_RAMP[0]}{IMB_RAMP[1]}{IMB_RAMP[2]}{IMB_RAMP[3]}{IMB_RAMP[4]}'"
@@ -414,14 +441,16 @@ def frame(rows: list[dict], coin: str, view: str, span: float, height: int,
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="liquidation map over time, in the terminal")
     parser.add_argument("--coin", required=True)
-    parser.add_argument("--since", default="6h")
+    parser.add_argument("--since", default="6h",
+                        help="window back from now, or 'max' for everything on disk")
     parser.add_argument("--until", default=None)
     parser.add_argument("--view", choices=("absolute", "relative"), default="absolute")
     parser.add_argument("--span", type=float, default=0.05,
                         help="half-height of the price axis as a fraction of mark")
     parser.add_argument("--rows", type=int, default=32)
     parser.add_argument("--width", type=int, default=0, help="0 = fit the terminal")
-    parser.add_argument("--ascii", action="store_true", help="no colour")
+    parser.add_argument("--ascii", action="store_true",
+                        help="digits instead of blocks, and no colour; for pipes and notes")
     parser.add_argument("--bands", default="",
                         help="comma-separated imb bands to strip, e.g. 0.01,0.02,0.05")
     parser.add_argument("--liquidations", action="store_true",
@@ -431,7 +460,19 @@ def main(argv: list[str] | None = None) -> int:
 
     now = int(datetime.now(timezone.utc).timestamp() * NS)
     until = parse_when(args.until, now) if args.until else now
-    since = parse_when(args.since, until)
+    floor_ns = earliest_ns()
+    if args.since.strip().lower() in ("max", "all"):
+        if floor_ns is None:
+            print(f"no {STREAM} history in {RAW}", file=sys.stderr)
+            return 1
+        since, clamped = floor_ns, False
+    else:
+        since = parse_when(args.since, until)
+        # Clamped, and the header says so. A window that opens before the tape
+        # does is not an error, but rendering it silently makes the empty rows
+        # look like absent clusters rather than absent data.
+        clamped = floor_ns is not None and since < floor_ns
+        since = max(since, floor_ns) if floor_ns is not None else since
     rows = snapshots(args.coin, since, until)
     if not rows:
         print(f"no {STREAM} snapshots for {args.coin} in {iso(since)} -> {iso(until)}",
@@ -446,7 +487,10 @@ def main(argv: list[str] | None = None) -> int:
     colour = not args.ascii and sys.stdout.isatty()
     bands = [b.strip() for b in args.bands.split(",") if b.strip()]
     events = liquidations(args.coin, since, until) if args.liquidations else None
-    print(frame(rows, args.coin, args.view, args.span, args.rows, width, colour, bands, events))
+    if clamped:
+        print(f"  (asked for more history than exists; clamped to {iso(since)})")
+    print(frame(rows, args.coin, args.view, args.span, args.rows, width, colour, bands,
+                events, ascii_only=args.ascii))
     return 0
 
 

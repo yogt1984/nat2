@@ -38,6 +38,21 @@ def trade(tid: int, coin: str = "BTC", t_ms: int = 1_755_000_000_000, px: str = 
             "users": [f"0x{tid:040x}", f"0x{tid + 1:040x}"]}
 
 
+def book(tid: int, coin: str = "BTC", t_ms: int = 1_755_000_000_000) -> dict:
+    """One book snapshot, in the shape `_field_time` expects.
+
+    A second stream is what makes "one subscription died and the others did not"
+    expressible at all: with one stream there is no difference between a lost
+    subscription and a dead socket.
+    """
+    return {"coin": coin, "time": t_ms + tid,
+            "levels": [[{"px": "99.9", "sz": "1.0", "n": 1}],
+                       [{"px": "100.1", "sz": "1.0", "n": 1}]]}
+
+
+FRAMES = {"trades": trade, "l2Book": book}
+
+
 class FakeVenue:
     """The websocket half. One behaviour per instance, chosen at construction.
 
@@ -48,24 +63,35 @@ class FakeVenue:
       "replay"  -- push `batch` prints, close, and replay the same tids on the
                    next connection before continuing. HL resends a backlog after
                    a reconnect and nothing in the store dedupes on write.
+
+    `drop_subs` + `drop_on_connection` express the failure the journal could only
+    show as a mystery: a reconnect that is acknowledged and then not honoured. On
+    that connection the named subscription types are answered with a
+    `subscriptionResponse` like any other and then never fed, so the socket looks
+    healthy and carries every other stream while one of them is simply gone.
     """
 
     def __init__(self, behaviour: str = "stream", batch: int = 3,
-                 interval_s: float = 0.02, coin: str = "BTC"):
+                 interval_s: float = 0.02, coin: str = "BTC",
+                 drop_subs: tuple[str, ...] = (), drop_on_connection: int = 0):
         self.behaviour = behaviour
         self.batch = batch
         self.interval_s = interval_s
         self.coin = coin
+        self.drop_subs = set(drop_subs)
+        self.drop_on_connection = drop_on_connection
         self.connections = 0
         self.subscriptions: list[dict] = []
+        self.honoured: list[set[str]] = []
         self.pings = 0
         self.frames_sent = 0
         self.tids_sent: list[int] = []
         self.url = ""
         self._server = None
         self._next_tid = 0
+        self._open: set = set()
 
-    async def _read(self, connection) -> None:
+    async def _read(self, connection, nth: int, live: set[str]) -> None:
         """Consume what the client sends: subscribe frames, and app-level pings."""
         async for raw in connection:
             try:
@@ -76,22 +102,37 @@ class FakeVenue:
                 self.pings += 1
                 await connection.send(json.dumps({"channel": "pong"}))
             elif message.get("method") == "subscribe":
-                self.subscriptions.append(message.get("subscription", {}))
+                sub = message.get("subscription", {})
+                self.subscriptions.append(sub)
+                if not (nth == self.drop_on_connection and sub.get("type") in self.drop_subs):
+                    live.add(sub.get("type"))
+                # Acknowledged either way. That is the whole point: the ack is not
+                # evidence the subscription is live, and the client believed it was.
                 await connection.send(json.dumps(
                     {"channel": "subscriptionResponse", "data": message}))
 
-    async def _send(self, connection, tids: list[int]) -> None:
+    async def _send(self, connection, tids: list[int], channel: str = "trades") -> None:
         await connection.send(json.dumps({
-            "channel": "trades",
-            "data": [trade(tid, self.coin) for tid in tids],
+            "channel": channel,
+            "data": ([FRAMES[channel](tid, self.coin) for tid in tids] if channel == "trades"
+                     else FRAMES[channel](tids[-1], self.coin)),
         }))
         self.frames_sent += 1
-        self.tids_sent.extend(tids)
+        if channel == "trades":
+            self.tids_sent.extend(tids)
+
+    async def kill(self) -> None:
+        """Drop every open connection, the way a link flap does."""
+        for connection in list(self._open):
+            await connection.close()
 
     async def _handler(self, connection) -> None:
         self.connections += 1
         nth = self.connections
-        reader = asyncio.create_task(self._read(connection))
+        live: set[str] = set()
+        self.honoured.append(live)
+        self._open.add(connection)
+        reader = asyncio.create_task(self._read(connection, nth, live))
         try:
             await asyncio.sleep(SETTLE_S)          # let the subscribes land first
             if self.behaviour == "silent":
@@ -110,12 +151,18 @@ class FakeVenue:
                 while True:
                     tids = [self._next_tid + i for i in range(self.batch)]
                     self._next_tid += self.batch
-                    await self._send(connection, tids)
+                    # Only what this connection actually honoured. With no `drop_subs`
+                    # that is every subscription, which is what every existing scenario
+                    # was written against.
+                    for channel in ("trades", "l2Book"):
+                        if channel in live:
+                            await self._send(connection, tids, channel)
                     await asyncio.sleep(self.interval_s)
         except Exception:                          # noqa: BLE001 - a closed peer is normal
             pass
         finally:
             reader.cancel()
+            self._open.discard(connection)
 
     async def start(self) -> "FakeVenue":
         self._server = await serve(self._handler, "127.0.0.1", 0)

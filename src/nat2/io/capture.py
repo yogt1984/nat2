@@ -17,6 +17,7 @@ import asyncio
 import contextlib
 import errno
 import signal
+import time
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -52,6 +53,18 @@ class CaptureWriteFailed(RuntimeError):
     """
 
 
+class CaptureTaskFailed(RuntimeError):
+    """One of the daemon's tasks died of something it did not expect.
+
+    The third way to go quiet, and until it had a name it wore the first one's
+    clothes: `run()` parks on `_stop`, so an exception in `_tape`, `_poller` or
+    `_flusher` that is not an `OSError` killed only that task, was swallowed by
+    `gather(..., return_exceptions=True)`, and surfaced `stall_s` later as
+    "silent hl.trades" -- pointing the operator at the venue for a `KeyError`
+    in our own parser.
+    """
+
+
 @dataclass
 class CaptureConfig:
     root: Path
@@ -72,6 +85,7 @@ class CaptureStats:
     # Why, not just how many: 2,298 identical failures are one bug, 2,298
     # different ones are another, and a bare counter cannot tell them apart.
     poll_failures: Counter = field(default_factory=Counter)
+    status_errors: int = 0
 
     def bump(self, stream: str) -> None:
         self.written[stream] = self.written.get(stream, 0) + 1
@@ -89,6 +103,7 @@ class Capture:
         self.ws: WsClient | None = None
         self.stalled: str | None = None
         self.write_failure: str | None = None
+        self.task_failure: str | None = None
         self._stop = asyncio.Event()
 
     def _subscriptions(self) -> list[Subscription]:
@@ -103,21 +118,38 @@ class Capture:
                 subs.append(Subscription(spec.sub_type))
         return subs
 
+    def _watched(self) -> list[str]:
+        """The streams this process is the producer of.
+
+        `nat2.liqmap` shares the store but is written by `nat2 cycle`, so a
+        capture handed it as a `--stream` was killed every `stall_s` forever for
+        not writing something it was never going to write.
+        """
+        return [name for name in self.writers
+                if name == "hl.assetctxs" or (name in STREAMS and STREAMS[name].channel)]
+
     async def run(self) -> None:
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
             with contextlib.suppress(NotImplementedError):
                 loop.add_signal_handler(sig, self.stop)
 
-        tasks = [asyncio.create_task(self._flusher())]
+        tasks = []
+
+        def spawn(name: str, coro) -> None:
+            task = asyncio.create_task(coro)
+            task.add_done_callback(lambda t: self._task_done(name, t))
+            tasks.append(task)
+
+        spawn("flusher", self._flusher())
         if self.config.stall_s:
-            tasks.append(asyncio.create_task(self._stall_watch()))
+            spawn("stall watch", self._stall_watch())
         if "hl.assetctxs" in self.writers:
-            tasks.append(asyncio.create_task(self._poller()))
+            spawn("poller", self._poller())
         if self._subscriptions():
-            tasks.append(asyncio.create_task(self._tape()))
+            spawn("tape", self._tape())
         if self.on_status:
-            tasks.append(asyncio.create_task(self._status()))
+            spawn("status", self._status())
         try:
             await self._stop.wait()
         finally:
@@ -127,12 +159,34 @@ class Capture:
             # Closed first: shutdown is what appends the manifest entries, so a stalled
             # capture still leaves a complete, checksummed part behind.
             self.close()
-        # Checked first: a store that cannot be written also looks silent, and
-        # the silence is the symptom rather than the diagnosis.
+        # Ordered by how specific the diagnosis is, because all three end as
+        # "no records arrived": a store that cannot be written looks silent, and
+        # so does a task that is no longer running. The silence is the symptom
+        # rather than the diagnosis, so it is reported last.
         if self.write_failure:
             raise CaptureWriteFailed(self.write_failure)
+        if self.task_failure:
+            raise CaptureTaskFailed(self.task_failure)
         if self.stalled:
             raise CaptureStalled(self.stalled)
+
+    def _task_done(self, name: str, task: asyncio.Task) -> None:
+        """Stand down because a task died, naming it. Never raises.
+
+        Cancellation is how shutdown works, and `run()` cancels every task in
+        its `finally`, so only a task that dies while the daemon still expects
+        to be running is a failure.
+        """
+        if task.cancelled() or self._stop.is_set() or self.task_failure:
+            return
+        exc = task.exception()
+        if exc is None:
+            return
+        self.task_failure = (
+            f"{name} died: {reason(exc)} ({exc}) -- exiting so the supervisor can restart; "
+            "this is our own defect, not the venue's"
+        )
+        self.stop()
 
     def _write_failed(self, stream: str, exc: OSError) -> None:
         """Stand down because the store rejected a write. Never raises.
@@ -232,27 +286,66 @@ class Capture:
         hours writing nothing. Assumes each subscribed stream is naturally sub-minute
         (18 coins of trades, a 10 s poll); a deliberately thin capture should raise
         `--stall-s` rather than be killed for being quiet.
+
+        **Monotonic, not wall clock.** `asyncio.sleep` advances on `time.monotonic()`,
+        which does not tick across s2idle, so measuring silence with `now_ns()` made every
+        suspend longer than `stall_s` a guaranteed kill on resume -- three of them between
+        09-13 and 09-14, one reporting an age of 95,360 s for a process that had been
+        asleep, not silent. Nothing could have been written while the host slept, and
+        nothing downstream wants the process dead for it: the hole belongs to `gapwatch`,
+        which measures the tape rather than the daemon.
         """
-        started, last, seen = now_ns(), {}, {}
+        started, last, seen = time.monotonic(), {}, {}
+        waited, excused, bounced = self.budget.wait_s, 0.0, set()
         while not self._stop.is_set():
-            if self.write_failure:
+            if self.write_failure or self.task_failure:
                 # Same 30 s period as the flusher, and created after it, so
                 # without this the "silent ..." message overwrites the one that
                 # names the actual cause.
                 return
             await asyncio.sleep(min(self.config.stall_s / 5, 30.0))
-            now = now_ns()
+            now = time.monotonic()
             for stream in self.writers:
                 written = self.stats.written.get(stream, 0)
                 if written > seen.get(stream, 0):
                     seen[stream], last[stream] = written, now
-            silent = {s: (now - last.get(s, started)) / NS for s in self.writers
-                      if now - last.get(s, started) > self.config.stall_s * NS}
+            watched = self._watched()
+            silent = {s: now - last.get(s, started) for s in watched
+                      if now - last.get(s, started) > self.config.stall_s}
+            # Being held off by our own rate limiter is not the venue going quiet. The
+            # 6-hourly registry sweep reserves 60% of the per-IP budget and the poller
+            # queues behind it; three non-outage kills landed inside one of those windows,
+            # every one of them printing "no errors reported" because there had been no
+            # error. `wait_s` rises only when *this* process was denied, so it is the
+            # precise signal -- and it is spent from a fixed allowance of 2 x stall_s, so
+            # an outage that merely coincides with budget pressure is still caught, and a
+            # process cannot excuse itself indefinitely the way the 2026-08-22 one did.
+            if "hl.assetctxs" in silent and self.budget.wait_s > waited \
+                    and excused < 2 * self.config.stall_s:
+                excused += silent.pop("hl.assetctxs")
+                last["hl.assetctxs"] = now
+            waited = self.budget.wait_s
+            # Try the cheap repair before the expensive one. A stream that went quiet
+            # while its siblings kept flowing is the shape of a subscription lost across
+            # a reconnect -- the socket is healthy and carrying the others -- and killing
+            # the process is a costly way to re-send a subscribe: a new part, a 10 s gap,
+            # a universe resolve and a manifest rescan. Bounced once per stream; if it is
+            # still silent `stall_s` later, stand down as before. Never when *everything*
+            # is silent, which is an outage and has nothing to re-subscribe to.
+            resubscribe = [s for s in silent if s not in bounced and STREAMS[s].channel]
+            if silent and self.ws and len(silent) < len(watched) \
+                    and len(resubscribe) == len(silent):
+                bounced.update(resubscribe)
+                self.ws.cycle()
+                for stream in resubscribe:
+                    last[stream] = now
+                continue
             if silent:
                 self.stalled = (
                     "silent " + ", ".join(f"{s} {age:.0f}s" for s, age in sorted(silent.items()))
-                    + f" ({self.why() or 'no errors reported'}) -- exiting so the supervisor can "
-                      "restart; the tape is a hole either way")
+                    + f" ({self.why() or 'no errors reported'})"
+                    + (" after a resubscribe" if bounced & set(silent) else "")
+                    + " -- exiting so the supervisor can restart; the tape is a hole either way")
                 self.stop()
                 return
 
@@ -271,9 +364,19 @@ class Capture:
                     return
 
     async def _status(self) -> None:
+        """The heartbeat, and the one task whose death is not fatal.
+
+        Every other task either writes the tape or guards it, so `_task_done`
+        stands the daemon down when one dies. This one writes a line to a
+        console: journald restarting under us, or any other broken pipe, must
+        not take the capture with it. Counted, so the silence is not free.
+        """
         while not self._stop.is_set():
             await asyncio.sleep(self.config.status_interval_s)
-            self.on_status(self)
+            try:
+                self.on_status(self)
+            except Exception:  # noqa: BLE001 - a status line is not the tape
+                self.stats.status_errors += 1
 
     def why(self) -> str:
         """The dominant failure reasons, for the status line."""

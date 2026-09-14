@@ -170,7 +170,7 @@ def capture_hl(
             _print_status(capture)
             console.print("[dim]writers closed; manifest updated[/dim]")
 
-    from nat2.io.capture import CaptureStalled, CaptureWriteFailed
+    from nat2.io.capture import CaptureStalled, CaptureTaskFailed, CaptureWriteFailed
     from nat2.io.universe import UniverseUnavailable
 
     try:
@@ -184,6 +184,11 @@ def capture_hl(
         # Distinct from a stall on purpose: "silent hl.trades" sends the
         # operator to the venue, and the answer is the disk.
         console.print(f"[red]capture write failed[/red]: {exc}")
+        raise typer.Exit(1) from None
+    except CaptureTaskFailed as exc:
+        # The third one, and the only one that is ours: a task died of something
+        # it did not expect. It used to arrive dressed as a stall, 300 s late.
+        console.print(f"[red]capture task failed[/red]: {exc}")
         raise typer.Exit(1) from None
     except UniverseUnavailable as exc:
         # Also not a crash. This used to leave a traceback and, under
@@ -228,6 +233,14 @@ def _print_status(capture) -> None:
     counts = ", ".join(f"{k.split('.')[-1]} {v}" for k, v in sorted(capture.stats.written.items()))
     ws = capture.ws.stats if capture.ws else None
     extra = f" | reconnects {ws.reconnects}" if ws else ""
+    # Both printed only when they are not the healthy answer, because a status line
+    # nobody reads is worth nothing. Starvation by our own limiter and an outage at
+    # the venue used to print the identical line, and a half-subscribed socket
+    # printed the same line as a whole one.
+    if ws and ws.acked < ws.subscribed:
+        extra += f" | subs {ws.acked}/{ws.subscribed}"
+    if capture.budget.waits:
+        extra += f" | budget waits {capture.budget.waits} ({capture.budget.wait_s:.0f}s)"
     console.print(
         f"[dim]{capture.uptime_s / 60:6.1f}m | {counts or 'no records yet'}"
         f" | poll err {capture.stats.poll_errors}{extra}[/dim]"

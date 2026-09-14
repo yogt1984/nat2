@@ -39,6 +39,12 @@ class WsStats:
     frames: int = 0
     reconnects: int = 0
     last_frame_ns: int = 0
+    # Per connection, not cumulative: what matters is whether the subscription set
+    # we are holding right now was accepted, and a lifetime total cannot say that.
+    # Sent and acknowledged were assumed equal until a reconnect came back with
+    # `trades` alive and `l2book` gone, which read as a 300 s mystery.
+    subscribed: int = 0
+    acked: int = 0
     # Counted by reason. 1,737 reconnects in one run said nothing about why;
     # an unbounded list of strings would only have hidden it differently.
     reasons: Counter = field(default_factory=Counter)
@@ -50,9 +56,20 @@ class WsClient:
         self.subs = subs
         self.stats = WsStats()
         self._stop = asyncio.Event()
+        self._cycle = asyncio.Event()
 
     def stop(self) -> None:
         self._stop.set()
+
+    def cycle(self) -> None:
+        """Drop this connection and open another, re-sending every subscription.
+
+        The repair the stall watchdog never had. A subscription lost across a
+        reconnect leaves a healthy socket carrying some streams and not others,
+        and the only remedy in the daemon was killing the process -- which
+        re-subscribes by way of a restart, a new part and a 10 s gap.
+        """
+        self._cycle.set()
 
     async def stream(self):
         """Yield ``(channel, data, t_ingest)`` until stopped.
@@ -64,15 +81,27 @@ class WsClient:
         while not self._stop.is_set():
             try:
                 async with websockets.connect(self.url, max_size=None) as ws:
+                    self._cycle.clear()
+                    self.stats.subscribed = self.stats.acked = 0
                     for sub in self.subs:
                         await ws.send(json.dumps(sub.message()))
-                    backoff = 1.0
+                        self.stats.subscribed += 1
                     pinger = asyncio.create_task(self._ping(ws))
                     try:
                         async for frame in ws:
                             t_ingest = now_ns()
                             if self._stop.is_set():
                                 break
+                            if self._cycle.is_set():
+                                self.stats.reconnects += 1
+                                self.stats.reasons["resubscribe"] += 1
+                                break
+                            # Reset here rather than after `connect()`: a socket that
+                            # accepts the subscribes and then dies delivering nothing
+                            # used to clear the backoff on every attempt and hammer at
+                            # 1 s for as long as it kept doing it. A frame is the first
+                            # evidence the connection is actually good for anything.
+                            backoff = 1.0
                             self.stats.frames += 1
                             self.stats.last_frame_ns = t_ingest
                             try:
@@ -81,7 +110,10 @@ class WsClient:
                                 self.stats.reasons["undecodable frame"] += 1
                                 continue
                             channel = msg.get("channel")
-                            if channel in (None, "pong", "subscriptionResponse"):
+                            if channel == "subscriptionResponse":
+                                self.stats.acked += 1
+                                continue
+                            if channel in (None, "pong"):
                                 continue
                             yield channel, msg.get("data"), t_ingest
                     finally:

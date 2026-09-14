@@ -20,13 +20,25 @@ Clean tape-days are the only resource that cannot be bought back. Code, specific
 refactoring are cheap and recoverable; a day of holed capture is gone. Every ordering decision
 below follows from that, and from one measurement:
 
-> Since 2026-09-10 the capture journal holds **1,394 RuntimeError, 292 ConnectionClosedError,
-> 198 OSError and 143 TimeoutError**, against exactly **one** clean `RuntimeMaxSec` recycle.
-> 2026-09-12 has no parts at all. A healthy day holds ~29 parts; 09-10 holds 3, 09-11 holds 2.
+> Since 2026-09-10 systemd recorded **194 non-zero exits** of `nat2-capture` against exactly
+> **one** clean `RuntimeMaxSec` recycle. **191 of them fall inside a single window, 09-10
+> 00:00–20:00**, at the ~354 s period of a 300 s stall plus a 10 s restart; **184 of those
+> processes never wrote a record**, dying at 5.1 m with `ws: gaierror` — no resolver at all.
+> NetworkManager brackets the window exactly: `wlp0s20f3` `ssid-not-found` at 06:51:03,
+> `Activation: successful` at 20:24:26.
 
-Capture is not degrading, it is crash-looping, and the defect is in the reconnect path rather than
-in the host. That single fact reorders the programme: the migration is deferred, because moving a
-crash-looping daemon produces a crash-looping daemon on a new box a month later.
+Capture is crash-looping, but the loop is a **host** outage seen through our own watchdog, not a
+defect in the reconnect path: `ws.py` reconnects unboundedly and forever, and during those 13 h 33 m
+there was nothing to reconnect to. Every one of the 194 exits is `CaptureStalled` — the daemon
+standing down deliberately, as designed, so the supervisor can restart it.
+
+*Amended 2026-09-14 (P02).* This paragraph previously cited four error counts (1,394 RuntimeError,
+292 ConnectionClosedError, 198 OSError, 143 TimeoutError) and three part-counts. The error counts
+were journal **line** counts of a cumulative status line reprinted every 60 s — they grow with
+minutes elapsed rather than with failures, and 113 of the 198 `OSError` lines are one byte-identical
+line. They are uninterpretable in both directions and have been deleted rather than corrected. The
+missing parts on 09-11 and 09-12 are host **suspends** (09-12 12:18 → 09-13 14:47), not crashes:
+su-35 is a laptop. What survives is the exit count, which is the number that matters.
 
 Inherited rules, unchanged and binding on every row below:
 
@@ -100,23 +112,61 @@ claims to sequence work.
 Done when: the ledger entry exists, `docs/archive/` holds both files, and `README.md`'s status
 block is the only live status statement.
 
-### P02 · Fix the capture crash loop
-**Status** todo · **Ledger?** no · **Unblocks** P03, and through it every gate
+### P02 · Stop the watchdog killing a daemon that is working
+**Status** doing · **Ledger?** no · **Unblocks** P03, and through it every gate
 
-What: capture exits non-zero on network churn instead of reconnecting. The error mix since
-2026-09-10 is 1,394 RuntimeError, 292 ConnectionClosedError, 198 OSError, 143 TimeoutError against
-one clean recycle. `FINDINGS.md` already carries the unexplained 49% `metaAndAssetCtxs` failure
-rate after 19.5 h as an open cause; this is the same wound, now fatal rather than degrading.
+*Rewritten 2026-09-14 on the evidence in §0.* This row previously read "capture exits non-zero on
+network churn instead of reconnecting", and prescribed a planted test that drops the socket and
+asserts the daemon reconnects. Both are wrong: the socket drop already reconnects (a *clean* close
+does not even raise, pinned at `tests/test_fake_hl.py:96-100`), and the old done-when — 72 h with
+zero `exit-code` failures — is unreachable on a laptop that tethers and suspends, so it measured the
+host rather than the code. What is actually broken is the watchdog's judgement, not the reconnect.
 
-How: reproduce against `tests/fake_hl.py` (task 08's loopback venue) by dropping the socket mid
-stream and asserting the daemon reconnects rather than exits. Fix the reconnect path. Treat
-`RuntimeMaxSec=5h` as the recycle it is, not as the crash handler it has become.
+What: `_stall_watch` has one input — records written per stream — and one remedy, killing the
+process. Four distinct conditions are compressed into that one death sentence, and three of them are
+a daemon that is working:
 
-How verified: a planted test that kills the connection N times and asserts zero process exits;
-then 72 h of real capture.
+1. **The host was asleep.** The watchdog measured silence on `now_ns()` (wall clock) while
+   `asyncio.sleep` advances on `time.monotonic()`, which does not tick across s2idle. Every suspend
+   longer than `stall_s` was a guaranteed kill on resume — three of them 09-13/09-14, one reporting
+   an age of 95,360 s for a process that had been asleep, not silent.
+2. **We throttled ourselves.** The 6-hourly registry sweep reserves 60% of the per-IP budget and the
+   poller queues behind it. Three non-outage kills landed inside a sweep window, every one printing
+   `no errors reported` — because there had been no error.
+3. **A task died and the stall took the blame.** `run()` parks on `_stop`, so any non-`OSError` in
+   `_tape`/`_poller`/`_flusher` killed only that task, was swallowed by
+   `gather(..., return_exceptions=True)`, and surfaced `stall_s` later as "silent hl.trades" —
+   sending the operator to the venue for a defect of ours.
+4. **A subscription was lost across a reconnect.** `subscriptionResponse` was discarded in the same
+   branch as `pong`, so the client could not tell a whole subscription set from a half-dead one. One
+   stream sat frozen while its siblings flowed, and the only repair available was killing the
+   process — which re-subscribes by way of a restart, a new part and a 10 s gap.
 
-Done when: 72 consecutive hours with at least one part per clock hour, zero `exit-code` failures in
-`journalctl --user -u nat2-capture.service`, and `gapwatch` reporting no open hole.
+The fourth is the one the old row was reaching for, and it is real; it is simply not in the
+reconnect path.
+
+How: on `fix/capture-reconnect`, in a worktree — su-35's `src/` is the live editable install, so
+nothing lands in it until the suite is green. Watchdog on `time.monotonic()`; `wait_s` rising on our
+own limiter excuses `hl.assetctxs`, from a fixed allowance of 2 × `stall_s`; a done-callback per task
+so a dead one names itself (`CaptureTaskFailed`); per-connection `subscribed`/`acked` counters in
+`WsStats`; and `WsClient.cycle()`, so the watchdog bounces the socket and re-subscribes before it
+reaches for the process. Producerless streams (`nat2.liqmap`) are no longer watched.
+
+How verified: six planted tests that fail on the parent commit and pass here — a clock jump across a
+suspend, budget waits, the bound on that excuse, a producerless stream, a dead task naming itself,
+and the venue acknowledging `l2Book` on its second connection and then never feeding it. The last
+reproduces the production symptom exactly: on the parent it raises
+`silent hl.l2book … (no errors reported)`. Then real capture.
+
+Done when: the branch is merged `--no-ff`, and over 72 h of real capture **no exit is attributable
+to suspend, to budget starvation, or to a lost subscription** — outage-caused exits are counted and
+named separately, because they are the host's and P04 is where they are answered. Checked with
+`journalctl --user -u nat2-capture.service | grep 'capture stalled'`: no age above `stall_s` + 60,
+no `no errors reported`, and every remaining exit carrying a named ws or poll reason.
+
+Not in scope, deliberately: `ratelimit.py` gives the sweep a reserve but still counts everyone's
+spend, so a saturating sweep can still lock capture out. Per-owner spend accounting is a redesign;
+the watchdog carve-out plus a visible `budget waits` counter is the honest interim.
 
 ### P03 · Take `gate feed` to a verdict on the repaired tape
 **Status** blocked on P02 · **Ledger?** no (the gate writes its own) · **Unblocks** P10, P11
@@ -135,13 +185,31 @@ What: `docs/hetzner_plan` is 28 tasks of production operations (restic, Caddy, D
 blast shield) wrapped around a research tape, of which 20 are untouched. If the defect found in P02
 is in nat2's code, it travels to any new host and the migration buys nothing this quarter.
 
-How: after P02 has held for 14 days, write the decision entry. Either capture is stable on su-35,
-in which case the migration is deferred and P20–P23 stay `deferred`; or a named failure mode
-requires a different host, in which case P20 is scoped to a **capture-only** subset (a box that
-stays up, a disk that does not fill, a watchdog) and the remaining infrastructure tasks stay
-deferred.
+**The evidence split, recorded 2026-09-14 (from P02) — and it does not point the way this row
+assumed.** The premise above was that P02 would find a code defect, which travels. It found both,
+and they are separable:
 
-Done when: the ledger holds a decision entry naming which branch was taken and the evidence for it.
+- **Host, and it does not travel: 191 of 194 exits.** One 13 h 33 m wifi outage on a phone hotspot
+  (`wlp0s20f3`, "Galaxy S10"), plus daily s2idle suspends that account for the 09-11 and 09-12 gaps.
+  A wired, always-on box removes this entire class. That is an argument *for* migrating, not for
+  deferring.
+- **Code, and it travels: ~6 exits and one silent stream.** The suspend clock, the budget
+  starvation, the mis-attributed dead task and the lost subscription — all fixed in P02, all of
+  which would have followed the tape to Hetzner.
+
+So the fork stated below is not the fork we face. Capture being stable on su-35 *after* P02 is now
+the less likely branch, because P02 cannot fix a tethered laptop that sleeps. The honest decision is
+between accepting a tape holed by the host and moving capture to a box that stays up.
+
+How: after P02 has held for 14 days, write the decision entry — and count the two causes separately,
+since only one of them P02 can have fixed. Either capture is stable on su-35, in which case the
+migration is deferred and P20–P23 stay `deferred`; or a named failure mode requires a different host,
+in which case P20 is scoped to a **capture-only** subset (a box that stays up, a disk that does not
+fill, a watchdog) and the remaining infrastructure tasks stay deferred. On the evidence above the
+second branch is the likely one, and the capture-only scoping is what makes it cheap.
+
+Done when: the ledger holds a decision entry naming which branch was taken and the evidence for it,
+with host-caused and code-caused exits counted separately.
 
 ---
 

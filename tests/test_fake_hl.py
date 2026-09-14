@@ -78,6 +78,74 @@ def test_a_live_venue_is_captured_into_the_store(tmp_path, monkeypatch):
     asyncio.run(scenario())
 
 
+def test_a_healthy_capture_never_bounces_its_socket(tmp_path, monkeypatch):
+    """The guard on the repair. The watchdog may now drop a connection to re-subscribe,
+    and the first cut of that test asked whether the silent set was a subset of the
+    watched set -- which the empty set also is, so a daemon with nothing wrong bounced
+    every tick. The venue counts connections, and one run is one connection."""
+    async def scenario():
+        async with fake_venue(behaviour="stream", batch=2, interval_s=0.02) as venue:
+            monkeypatch.setattr(ws_module, "WS_URL", venue.url)
+            capture = _capture(tmp_path, stall_s=0.5)     # watchdog awake, tick 0.1 s
+            await _run_briefly(capture, 1.2)
+            assert venue.connections == 1, "the watchdog bounced a socket that was fine"
+            assert capture.ws.stats.reconnects == 0
+
+    asyncio.run(scenario())
+
+
+def test_the_client_knows_whether_its_subscriptions_were_acknowledged(tmp_path, monkeypatch):
+    """The ack used to be discarded in the same breath as `pong`, so the client could not
+    tell a live subscription set from a half-dead one. Counted per connection, because a
+    lifetime total cannot answer the only question worth asking: is the set we are
+    holding *now* the set we asked for?"""
+    async def scenario():
+        async with fake_venue(behaviour="stream", batch=2, interval_s=0.02) as venue:
+            monkeypatch.setattr(ws_module, "WS_URL", venue.url)
+            capture = _capture(tmp_path, streams=("hl.trades", "hl.l2book"), stall_s=0)
+            await _run_briefly(capture, 0.6)
+            stats = capture.ws.stats
+            assert stats.subscribed == len(capture._subscriptions()) == 2
+            assert stats.acked == stats.subscribed, "the venue acknowledged fewer than we sent"
+
+    asyncio.run(scenario())
+
+
+def test_a_subscription_lost_across_a_reconnect_is_resubscribed_not_killed(tmp_path, monkeypatch):
+    """PID 229277's shape: `trades` and `assetctxs` advancing while `l2book` sat frozen
+    from the moment of a reconnect. The socket was healthy and the ack had come back, so
+    nothing looked wrong until the watchdog killed the process 300 s later -- which
+    re-subscribed by way of a restart, a new part and a 10 s gap.
+
+    Here the venue acknowledges `l2Book` on its second connection and then never feeds it.
+    The watchdog must bounce the socket, get the subscription back, and keep the process
+    and its part alive."""
+    async def scenario():
+        async with fake_venue(behaviour="stream", batch=2, interval_s=0.02,
+                              drop_subs=("l2Book",), drop_on_connection=2) as venue:
+            monkeypatch.setattr(ws_module, "WS_URL", venue.url)
+            capture = _capture(tmp_path, streams=("hl.trades", "hl.l2book"), stall_s=1.0)
+            runner = asyncio.create_task(capture.run())
+            await asyncio.sleep(0.4)
+            before = capture.stats.written["hl.l2book"]
+            await venue.kill()                       # the link flaps; the client reconnects
+            await asyncio.sleep(3.0)                 # 2nd connection is deaf on l2Book
+            frozen = capture.stats.written["hl.l2book"]
+            trades = capture.stats.written["hl.trades"]
+            await asyncio.sleep(1.5)
+            capture.stop()
+            await runner
+
+            assert capture.stalled is None, f"killed instead of resubscribed: {capture.stalled}"
+            assert venue.connections >= 3, "the watchdog never bounced the socket"
+            assert frozen > before, "the scenario did not capture l2book before the drop"
+            assert capture.stats.written["hl.l2book"] > frozen, "l2book never came back"
+            assert capture.stats.written["hl.trades"] > trades, "trades stopped too"
+            assert {"l2Book", "trades"} <= venue.honoured[-1], "the last connection is not whole"
+
+    asyncio.run(scenario())
+
+
 def test_a_reconnect_replays_the_backlog_and_nothing_dedupes_it(tmp_path, monkeypatch):
     """HL resends a backlog after a reconnect and the store dedupes nothing on write,
     so the same tid can appear twice in the tape. Any consumer that counts prints has

@@ -445,6 +445,14 @@ def _load_aa():
         # Spelled out rather than taken from aa_getrenderparams(), which returns
         # dither=2 (Floyd-Steinberg) and would make the frame depend on the
         # library's defaults -- and on a future libaa changing them.
+        #
+        # BOUND TO A NAME, and kept alive in the cache below, on purpose. Inlining
+        # it -- `aa_render(ctx, ctypes.addressof(Render(...)), ...)` -- passes the
+        # address of a temporary that CPython frees before the call returns, and
+        # aalib then reads a dead struct. It does not crash and it does not raise:
+        # it renders a page of spaces, or whatever the freed memory happened to
+        # say. A prototype lost an afternoon to that during this port, so do not
+        # "simplify" this line.
         options = Render(bright=0, contrast=0, gamma=1.0, dither=0,
                          inversion=0, randomval=0)
         loaded = (ctypes, lib, Hardware, options)

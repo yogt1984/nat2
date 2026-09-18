@@ -433,3 +433,280 @@ def test_a_window_inside_the_budget_is_left_alone(tmp_path):
     assert floor == first and kept == full
     floor, _, _ = liqview.budget_window(first, last, 0.0, root=root)
     assert floor == first, "--budget 0 means no limit"
+
+
+# --- aalib tone (task 06) ---------------------------------------------------
+
+needs_aa = pytest.mark.skipif(liqview._load_aa() is None,
+                              reason="libaa is not installed on this box")
+
+
+def _blind(monkeypatch):
+    """Make the box look like one without libaa, cache and all."""
+    monkeypatch.setattr(liqview, "_AA_LIB", [None])
+    monkeypatch.setattr(liqview, "_AA_RAMP", [None])
+
+
+@needs_aa
+def test_the_aa_ramp_is_monotone_in_brightness():
+    """The reason aalib is usable for a heatmap at all.
+
+    aalib picks glyphs by SHAPE, which for a photograph is the point and here
+    would be a disaster: a ramp whose glyphs do not order by ink is not a scale,
+    it is decoration. With a flat cell and no dithering the mapping collapses to
+    pure brightness, and this pins that -- if a future libaa or font broke it,
+    every frame would still render and quietly stop meaning anything.
+    """
+    ramp = liqview.aa_ramp()
+    assert ramp and len(ramp) > len(liqview.RAMP), "aalib must beat the block ramp"
+    assert ramp[0] == " ", "the empty cell must be blank"
+    assert ramp == "".join(dict.fromkeys(ramp)), f"a glyph recurs: {ramp!r}"
+
+    # Walk the whole brightness range: the glyph must never go backwards.
+    field = liqview._aa_field([[b / 255 for b in range(256)]], 256, 1)
+    index = [ramp.index(c) for c in field[0]]
+    assert index == sorted(index), "brightness must not map back down the ramp"
+    assert index[0] == 0 and index[-1] == len(ramp) - 1
+
+
+@needs_aa
+def test_no_overlay_glyph_is_also_a_shade():
+    """An overlay you cannot tell from a shade is worse than no overlay.
+
+    The block ramp is three shade characters and a full block, so anything is
+    free to sit on it. aalib's ramp is most of the printable ASCII set, and it
+    swallowed two overlays outright: 'X', a large realized liquidation, drew
+    exactly like a dense cell -- on a picture whose whole subject is dense cells
+    -- and the ASCII mark 'o' like a middling one. Pinned for every combination,
+    because the ramp is the library's font table and not ours.
+    """
+    for ascii_only in (False, True):
+        for used_aa in (False, True):
+            ramp = (liqview.aa_ramp() if used_aa
+                    else (liqview.RAMP_ASCII if ascii_only else liqview.RAMP))
+            overlays = liqview.overlay_glyphs(ascii_only, used_aa)
+            assert len(set(overlays)) == len(overlays), f"two overlays collide: {overlays}"
+            for glyph in overlays:
+                assert glyph not in ramp.strip(), (
+                    f"{glyph!r} is both an overlay and a shade "
+                    f"(ascii={ascii_only}, aa={used_aa})")
+
+
+@needs_aa
+def test_the_substituted_glyphs_reach_the_frame_and_its_legend(tmp_path):
+    """The substitution is worth nothing if the legend still names 'X'."""
+    _store(tmp_path, [(100.0, [[0.0, 1_000_000.0, 0.0, 1]]) for _ in range(8)])
+    rows = liqview.snapshots("BTC", T0, T0 + 8 * 60 * NS, root=tmp_path)
+    events = [{"t": rows[4]["t"], "px": 100.0, "notional": 5_000.0, "method": "m",
+               "late_s": 1.0}]
+    text = liqview.frame(rows, "BTC", "absolute", 0.05, 16, 8, colour=False,
+                         events=events, window=_window(rows), aa=True)
+    body = "\n".join(l.split("|", 1)[1] for l in text.splitlines() if "|" in l)
+    assert liqview.LIQ_LARGE_AA in body, "the substitute must actually be drawn"
+    assert f"'{liqview.LIQ_SMALL}/{liqview.LIQ_LARGE_AA}'" in text
+    assert f"'{liqview.LIQ_SMALL}/{liqview.LIQ_LARGE}'" not in text
+
+
+@needs_aa
+def test_a_glyph_reports_its_own_cell_and_no_other(tmp_path):
+    """The bug this design avoids, pinned as a property.
+
+    aalib's defaults -- 2x2 shape sampling over an interpolated buffer, plus
+    Floyd-Steinberg dithering -- make a cell's glyph depend on its NEIGHBOURS.
+    Measured on a 92-column BTC frame, that drew 21 of 624 distinct notionals as
+    more than one character. On a picture someone reads cluster sizes off, that
+    is the phantom-cluster bug again: mass that is not there, invented by the
+    renderer. Equal cells must draw equal, whatever surrounds them.
+    """
+    # A checkerboard: every cell's neighbourhood is the opposite of its value,
+    # so any bleed between cells shows up immediately.
+    buckets = [[(i - 12) * 0.002, 1_000_000.0 * (10 ** (i % 2)), 0.0, 2] for i in range(24)]
+    _store(tmp_path, [(100.0, buckets) for _ in range(12)])
+    rows = liqview.snapshots("BTC", T0, T0 + 12 * 60 * NS, root=tmp_path)
+
+    cells, _, _, _ = liqview.grid(rows, "absolute", 0.05, 20, 12)
+    art = liqview.render(rows, "absolute", 0.05, 20, 12, colour=False, aa=True)
+    body = [line.split("|", 1)[1] for line in art.splitlines()]
+
+    glyphs = {}
+    for y in range(20):
+        for x in range(12):
+            value = cells[y][x]
+            glyph = body[20 - 1 - y][x]
+            if glyph in (liqview.MARK_GLYPH, liqview.MARK_ASCII):
+                continue                                # the price line, not tone
+            glyphs.setdefault(round(value, 6), set()).add(glyph)
+    smeared = {v: g for v, g in glyphs.items() if len(g) > 1}
+    assert not smeared, f"equal notionals drew as different glyphs: {smeared}"
+
+
+@needs_aa
+def test_aa_tone_carries_more_levels_than_the_block_ramp(tmp_path):
+    """The whole point of the flag. Same data, same log scale, more of it
+    readable -- on the fixture that pins ramp saturation, so the comparison is
+    against the block ramp at its best rather than on a shape that flatters."""
+    bulk = [[i * 0.0015, 1_000_000.0 * (10 ** (2 * i / 45)), 0.0, 2] for i in range(45)]
+    tail = [[-0.0015 * (i + 1), 3.0, 0.0, 1] for i in range(5)]
+    _store(tmp_path, [(100.0, bulk + tail) for _ in range(10)])
+    rows = liqview.snapshots("BTC", T0, T0 + 10 * 60 * NS, root=tmp_path)
+
+    blocks = liqview.render(rows, "relative", 0.08, 24, 30, colour=False)
+    tone = liqview.render(rows, "relative", 0.08, 24, 30, colour=False, aa=True)
+    ramp = liqview.aa_ramp()
+    assert len(set(c for c in tone if c in ramp.strip())) > \
+        len(set(c for c in blocks if c in liqview.RAMP.strip()))
+
+
+@needs_aa
+@pytest.mark.parametrize("windowed", [True, False])
+def test_aa_does_not_change_the_shape_of_the_frame(tmp_path, windowed):
+    """Same grid, same axis, same width -- only the glyphs differ.
+
+    Both binnings, because they disagree about width and the first cut of the
+    aalib path sized its buffer off `width` instead of off the grid. Time bins
+    fill the frame; index bins drop empty columns, so 15 snapshots asked to fill
+    40 columns produce 15 -- and the buffer ran off the end of the row. The
+    invariant is that the two paths agree, not that either equals `width`.
+    """
+    _store(tmp_path, _ramp(15))
+    rows = liqview.snapshots("BTC", T0, T0 + 15 * 60 * NS, root=tmp_path)
+    window = _window(rows) if windowed else None
+    blocks = liqview.render(rows, "absolute", 0.05, 12, 40, colour=False,
+                            window=window).splitlines()
+    tone = liqview.render(rows, "absolute", 0.05, 12, 40, colour=False,
+                          window=window, aa=True).splitlines()
+    assert len(blocks) == len(tone) == 12
+    for a, b in zip(blocks, tone):
+        assert a.split("|", 1)[0] == b.split("|", 1)[0], "the price axis must not move"
+        assert len(a.split("|", 1)[1]) == len(b.split("|", 1)[1])
+    drawn = len(blocks[0].split("|", 1)[1])
+    assert drawn == (40 if windowed else 15)
+
+
+@needs_aa
+def test_a_hole_in_the_tape_stays_blank_under_aa(tmp_path):
+    """The failure that made this renderer flat-fill rather than interpolate: an
+    upsampled buffer bleeds ink sideways, and ink in a gap column is the frame
+    claiming data for hours nobody observed."""
+    root, first, last = _gapped(tmp_path)
+    rows = liqview.snapshots("BTC", first, last, root=root)
+    _, mark_row, _, _ = liqview.grid(rows, "absolute", 0.05, 10, 40, (first, last))
+    body = liqview.render(rows, "absolute", 0.05, 10, 40, colour=False,
+                          window=(first, last), aa=True).splitlines()
+    blank = [x for x, m in enumerate(mark_row) if m is None]
+    assert len(blank) > 25
+    for line in body:
+        drawn = line.split("|", 1)[1]
+        assert all(drawn[x] == " " for x in blank), "the hole must carry no ink"
+
+
+def test_without_libaa_the_frame_draws_blocks_and_says_so(tmp_path, monkeypatch):
+    """liqview is the tool you reach for when the box is already unhappy, so a
+    missing system library is a fallback and never a traceback -- and the frame
+    has to admit which ramp it drew, or the legend misstates the scale."""
+    _blind(monkeypatch)
+    _store(tmp_path, _ramp(10))
+    rows = liqview.snapshots("BTC", T0, T0 + 10 * 60 * NS, root=tmp_path)
+    assert liqview.aa_ramp() is None
+    assert liqview._aa_field([[0.5] * 8], 8, 1) is None
+
+    asked = liqview.render(rows, "absolute", 0.05, 12, 40, colour=False, aa=True)
+    assert asked == liqview.render(rows, "absolute", 0.05, 12, 40, colour=False)
+    text = liqview.frame(rows, "BTC", "absolute", 0.05, 12, 40, colour=False, aa=True)
+    assert "libaa is not installed" in text
+    assert liqview.RAMP.strip() in text
+
+
+@needs_aa
+def test_a_library_that_will_not_render_is_not_reported_as_a_missing_one(tmp_path,
+                                                                        monkeypatch):
+    """Falling back is fine. Blaming a library that is sitting right there is
+    not: it sends whoever reads the frame off to install what they already
+    have."""
+    _store(tmp_path, _ramp(10))
+    rows = liqview.snapshots("BTC", T0, T0 + 10 * 60 * NS, root=tmp_path)
+    monkeypatch.setattr(liqview, "_aa_field", lambda *a, **k: None)   # installed, refuses
+    text = liqview.frame(rows, "BTC", "absolute", 0.05, 12, 40, colour=False, aa=True)
+    assert "would not render at this size" in text
+    assert "not installed" not in text
+    assert liqview.RAMP.strip() in text
+
+
+def test_aa_off_is_byte_for_byte_what_it_always_was(tmp_path):
+    """The default path is what everyone's eye is calibrated to; a new flag must
+    not move it. Pinned against `RAMP` directly rather than a golden string, so
+    this still means something when the ramp is next retuned."""
+    _store(tmp_path, _ramp(15))
+    rows = liqview.snapshots("BTC", T0, T0 + 15 * 60 * NS, root=tmp_path)
+    art = liqview.render(rows, "absolute", 0.05, 12, 40, colour=False)
+    assert set(art) <= set(liqview.RAMP + liqview.MARK_GLYPH + " |,.0123456789\n")
+    text = liqview.frame(rows, "BTC", "absolute", 0.05, 12, 40, colour=False)
+    assert "aalib" not in text and "libaa" not in text
+
+
+# --- the realized-notional strip (task 06) ----------------------------------
+
+def _events(window, rows_n: int, at: dict[int, float]) -> list[dict]:
+    """`at` maps a column index in a `rows_n`-wide frame to a notional."""
+    since, until = window
+    span = until - since
+    return [{"t": since + (x * span) // rows_n + span // (2 * rows_n), "px": 100.0,
+             "notional": n, "method": "market", "late_s": 1.0}
+            for x, n in at.items()]
+
+
+def test_the_liq_strip_bins_on_the_same_columns_as_the_map(tmp_path):
+    """Its only value is being read against the frame above it. Off by one
+    column and it puts a cascade next to the move that caused it."""
+    _store(tmp_path, [(100.0, [[0.0, 1_000_000.0, 0.0, 1]]) for _ in range(20)])
+    rows = liqview.snapshots("BTC", T0, T0 + 20 * 60 * NS, root=tmp_path)
+    window = _window(rows)
+    events = _events(window, 20, {0: 1000.0, 7: 1000.0, 19: 1000.0})
+
+    line, floor, peak = liqview.liq_strip(events, window, 20)
+    assert len(line) == 20
+    assert [x for x, c in enumerate(line) if c != " "] == [0, 7, 19]
+    body = liqview.render(rows, "absolute", 0.05, 8, 20, colour=False, window=window)
+    assert len(body.splitlines()[0].split("|", 1)[1]) == len(line)
+
+
+def test_the_strip_ranks_notional_not_count(tmp_path):
+    """Ten small prints are not a cascade and one big one is. Counting would say
+    the opposite, and the strip exists precisely because the map cannot show
+    size at all."""
+    _store(tmp_path, [(100.0, [[0.0, 1_000_000.0, 0.0, 1]]) for _ in range(10)])
+    rows = liqview.snapshots("BTC", T0, T0 + 10 * 60 * NS, root=tmp_path)
+    window = _window(rows)
+    events = _events(window, 10, {2: 100.0}) + [
+        e for _ in range(10) for e in _events(window, 10, {8: 1_000_000.0})]
+
+    line, floor, peak = liqview.liq_strip(events, window, 10)
+    assert line[2] == liqview.LIQ_RAMP[0], f"the small print must sit at the floor: {line!r}"
+    assert line[8] == liqview.LIQ_RAMP[-1], f"the cascade must sit at the top: {line!r}"
+    assert floor == pytest.approx(100.0) and peak == pytest.approx(10_000_000.0)
+
+
+def test_the_strip_is_absent_rather_than_empty_when_nothing_was_liquidated(tmp_path):
+    _store(tmp_path, _ramp(6))
+    rows = liqview.snapshots("BTC", T0, T0 + 6 * 60 * NS, root=tmp_path)
+    window = _window(rows)
+    assert liqview.liq_strip(None, window, 20) is None
+    assert liqview.liq_strip([], window, 20) is None
+    text = liqview.frame(rows, "BTC", "absolute", 0.05, 10, 20, colour=False,
+                         events=[], window=window)
+    assert "liq $" not in text
+
+
+def test_the_frame_prints_the_strip_and_the_dollars_it_stands_for(tmp_path):
+    """A ramp without its bounds is a picture of a number nobody can read."""
+    _store(tmp_path, [(100.0, [[0.0, 1_000_000.0, 0.0, 1]]) for _ in range(12)])
+    rows = liqview.snapshots("BTC", T0, T0 + 12 * 60 * NS, root=tmp_path)
+    window = _window(rows)
+    events = _events(window, 12, {1: 500.0, 6: 250_000.0})
+    text = liqview.frame(rows, "BTC", "absolute", 0.05, 10, 12, colour=False,
+                         events=events, window=window)
+    assert "liq $" in text
+    assert "$500" in text and "$250,000" in text
+    strip = next(l for l in text.splitlines() if l.startswith(f"{'liq $':>10} |"))
+    body = next(l for l in text.splitlines() if "|" in l and l[:10].strip().isdigit())
+    assert len(strip.split("|", 1)[1]) == len(body.split("|", 1)[1])

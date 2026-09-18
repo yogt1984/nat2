@@ -10,7 +10,9 @@ that nobody registered.
 Stdlib only, on `/usr/bin/python3`. It joins gapwatch, statuspage and tapecheck
 as an ops tool that must survive a broken venv -- the venv being broken is one
 of the moments you most want to look at the tape. `zstandard` is a venv
-package, so decompression shells out to `/usr/bin/zstd`.
+package, so decompression shells out to `/usr/bin/zstd`. `--aa` shades through
+aalib, a system library reached by `ctypes`, and a box without it draws the
+block ramp instead -- optional in the same sense and for the same reason.
 
 Two things here are less obvious than they look.
 
@@ -72,6 +74,16 @@ IMB_RAMP = ("V", "v", "-", "^", "A")
 IMB_MILD, IMB_STRONG = 0.20, 0.60
 LIQ_SMALL, LIQ_LARGE = "x", "X"
 LIQ_LATE = "!"
+# Digits, for the realized-notional strip: they carry their own ordering, and
+# the strip sits under a map whose own ramp is already doing the shading.
+LIQ_RAMP = "123456789"
+# aalib's ramp is 23 glyphs of ordinary ASCII, and it swallows two of the
+# overlays: 'X' draws exactly like a dense cell and 'o' like a middling one. A
+# large liquidation that cannot be told from a big cluster, on the picture whose
+# entire subject is big clusters, is worse than not drawing it -- so under
+# aalib tone these stand in, chosen from outside every ramp here.
+MARK_ASCII_AA = "@"
+LIQ_LARGE_AA = "*"
 # Batched so 360 snapshots are a few subprocesses rather than 360 of them.
 BATCH = 200
 
@@ -334,11 +346,182 @@ def _percentile(values: list[float], q: float) -> float:
     return ordered[min(int(q * (len(ordered) - 1)), len(ordered) - 1)]
 
 
+# --- aalib -----------------------------------------------------------------
+#
+# aalib turns a grayscale buffer into characters. Given a FLAT cell -- all four
+# of its subpixels equal -- and no dithering, its glyph table is a strictly
+# monotone 24-level brightness ramp, against the five the block ramp carries.
+# That is the whole reason it is here: more levels on the same character grid.
+#
+# Flat and undithered are not presentation choices, they are the correctness of
+# the picture. aalib is built to make PHOTOGRAPHS legible: it samples 2x2
+# subpixels to pick glyphs by shape, and its default Floyd-Steinberg dithering
+# spreads each cell's quantisation error into its neighbours. Both are wrong
+# here. A cell is not a piece of a photograph, it is one price at one minute,
+# and either feature makes its glyph a function of the cells AROUND it: measured
+# on a real 92-column BTC frame, 21 of 624 distinct notionals drew as more than
+# one character depending on what sat next to them. That is the phantom-cluster
+# bug wearing a different hat, so the buffer is filled flat and dithering is off,
+# and the glyph is a function of that cell alone.
+#
+# Optional by construction. liqview is an ops tool that must survive a broken
+# venv, and a system library is a weaker dependency than that: a box without
+# libaa falls back to the block ramp and the frame says so.
+AA_SONAMES = ("libaa.so.1", "libaa.so")
+AA_DRIVER = "mem_d"                     # aalib exports its drivers unprefixed
+AA_NORMAL_MASK = 1                      # no bold, dim or reverse: plain 7-bit out
+_AA_LIB: list = []                      # one slot: [] = untried, [None] = absent
+_AA_RAMP: list = []
+
+
+def _load_aa():
+    """`(ctypes, lib, hardware_params, render_params)`, or None when absent.
+
+    Looked up once per process. `ctypes` is imported here rather than at the top
+    for the same reason `sqlite3` is: this file is a stdlib tool, and an import
+    it can do without is an import it should not do at module scope.
+    """
+    if _AA_LIB:
+        return _AA_LIB[0]
+    loaded = None
+    try:
+        import ctypes
+
+        lib = None
+        for soname in AA_SONAMES:
+            try:
+                lib = ctypes.CDLL(soname)
+                break
+            except OSError:
+                continue
+        if lib is None:
+            raise OSError("no libaa")
+
+        class Hardware(ctypes.Structure):
+            _fields_ = ([("font", ctypes.c_void_p), ("supported", ctypes.c_int)]
+                        + [(name, ctypes.c_int) for name in (
+                            "minwidth", "minheight", "maxwidth", "maxheight",
+                            "recwidth", "recheight", "mmwidth", "mmheight",
+                            "width", "height")]
+                        + [("dimmul", ctypes.c_double), ("boldmul", ctypes.c_double)])
+
+        class Render(ctypes.Structure):
+            _fields_ = [("bright", ctypes.c_int), ("contrast", ctypes.c_int),
+                        ("gamma", ctypes.c_float), ("dither", ctypes.c_int),
+                        ("inversion", ctypes.c_int), ("randomval", ctypes.c_int)]
+
+        lib.aa_init.restype = ctypes.c_void_p
+        lib.aa_init.argtypes = [ctypes.c_void_p] * 3
+        lib.aa_image.restype = lib.aa_text.restype = ctypes.POINTER(ctypes.c_ubyte)
+        lib.aa_image.argtypes = lib.aa_text.argtypes = [ctypes.c_void_p]
+        lib.aa_render.argtypes = [ctypes.c_void_p, ctypes.c_void_p] + [ctypes.c_int] * 4
+        lib.aa_close.argtypes = [ctypes.c_void_p]
+        # Spelled out rather than taken from aa_getrenderparams(), which returns
+        # dither=2 (Floyd-Steinberg) and would make the frame depend on the
+        # library's defaults -- and on a future libaa changing them.
+        options = Render(bright=0, contrast=0, gamma=1.0, dither=0,
+                         inversion=0, randomval=0)
+        loaded = (ctypes, lib, Hardware, options)
+    except (ImportError, OSError, AttributeError, ValueError):
+        loaded = None
+    _AA_LIB.append(loaded)
+    return loaded
+
+
+def overlay_glyphs(ascii_only: bool, used_aa: bool) -> tuple[str, str, str, str]:
+    """`(mark, small, large, late)` -- the glyphs that are drawn OVER the tone.
+
+    Every one of them has to be absent from the ramp underneath it. That is
+    free with blocks, whose ramp is three shade characters and a full block, and
+    it is not free with aalib, whose ramp is most of the ASCII set. Pinned by a
+    test rather than by reading, because the ramp comes from the library's font
+    tables and a different libaa could quietly reintroduce the collision.
+    """
+    mark = MARK_ASCII if ascii_only else MARK_GLYPH
+    large = LIQ_LARGE
+    if used_aa:
+        large = LIQ_LARGE_AA
+        if ascii_only:
+            mark = MARK_ASCII_AA
+    return mark, LIQ_SMALL, large, LIQ_LATE
+
+
+def _aa_field(levels: list[list[float]], width: int, height: int) -> list[str] | None:
+    """`levels` (0..1, row 0 at the BOTTOM) as `height` lines of `width` glyphs.
+
+    Row 0 of the result is the TOP of the frame, matching what `render` emits.
+    None means libaa is absent and the caller should draw the block ramp.
+    """
+    loaded = _load_aa()
+    if loaded is None:
+        return None
+    ctypes, lib, Hardware, options = loaded
+    # A copy: `aa_defparams` is the library's own global and other callers in
+    # this process would inherit whatever we left in it.
+    params = Hardware.from_buffer_copy(Hardware.in_dll(lib, "aa_defparams"))
+    params.width, params.height, params.supported = width, height, AA_NORMAL_MASK
+    # The memory driver renders into a text buffer instead of taking over the
+    # terminal, so `frame` still returns a string and the tests still read it.
+    context = lib.aa_init(ctypes.addressof(ctypes.c_char.in_dll(lib, AA_DRIVER)),
+                          ctypes.addressof(params), None)
+    if not context:
+        return None
+    context = ctypes.c_void_p(context)
+    try:
+        image, stride = lib.aa_image(context), 2 * width
+        for py in range(2 * height):
+            row, base = levels[height - 1 - py // 2], py * stride
+            for x in range(width):
+                shade = int(255 * row[x])
+                image[base + 2 * x] = shade
+                image[base + 2 * x + 1] = shade        # flat: no shape, no bleed
+        lib.aa_render(context, ctypes.addressof(options), 0, 0, width, height)
+        text = lib.aa_text(context)
+        return [bytes(text[r * width:(r + 1) * width]).decode("latin1")
+                for r in range(height)]
+    finally:
+        lib.aa_close(context)
+
+
+def aa_ramp() -> str | None:
+    """The library's own ramp, sparsest first -- or None when libaa is absent.
+
+    Probed, never hardcoded. The glyphs come from aalib's font tables, so a
+    different libaa build would quietly print a legend that is not the ramp on
+    the screen above it, and on this file a legend that lies about the scale is
+    the whole failure mode.
+    """
+    if _AA_RAMP:
+        return _AA_RAMP[0]
+    field = _aa_field([[b / 255 for b in range(256)]], 256, 1)
+    ramp = None
+    if field:
+        line = field[0]
+        ramp = "".join(c for i, c in enumerate(line) if i == 0 or c != line[i - 1])
+    _AA_RAMP.append(ramp)
+    return ramp
+
+
 def render(rows: list[dict], view: str, span: float, height: int, width: int,
            colour: bool, events: list[dict] | None = None, ascii_only: bool = False,
-           window: tuple[int, int] | None = None) -> str:
+           window: tuple[int, int] | None = None, aa: bool = False) -> str:
+    """The heatmap body. `aa` asks for aalib tone, and gets the ramp without it."""
+    return _render(rows, view, span, height, width, colour, events, ascii_only,
+                   window, aa)[0]
+
+
+def _render(rows: list[dict], view: str, span: float, height: int, width: int,
+            colour: bool, events: list[dict] | None = None, ascii_only: bool = False,
+            window: tuple[int, int] | None = None,
+            aa: bool = False) -> tuple[str, bool]:
+    """`(body, drawn_with_aalib)`.
+
+    The flag exists so the legend can name the ramp that is actually on screen.
+    `--aa` on a box without libaa draws blocks, and a legend claiming 24 levels
+    over a five-level picture misstates the scale -- which on this file is the
+    whole failure mode.
+    """
     ramp = RAMP_ASCII if ascii_only else RAMP
-    mark = MARK_ASCII if ascii_only else MARK_GLYPH
     cells, mark_row, lo, hi = grid(rows, view, span, height, width, window)
     step = (hi - lo) / height if hi > lo else 1.0
     values = [v for line in cells for v in line if v > 0]
@@ -356,6 +539,22 @@ def render(rows: list[dict], view: str, span: float, height: int, width: int,
     lo_log = math.log10(floor) if floor > 0 else 0.0
     hi_log = math.log10(ceiling) if ceiling > floor else lo_log + 1.0
     width_log = (hi_log - lo_log) or 1.0
+
+    # The same clipped log level the ramp is indexed by, handed to aalib as
+    # brightness instead. One cell, one flat pixel block, one glyph -- so the two
+    # paths draw the same scale and the legend can state it once for both.
+    # Sized off the grid, never off `width`: with no window `columns` falls back
+    # to index bins and drops the empty ones, so a frame can be narrower than the
+    # terminal asked for. The ramp path iterates the row and never noticed.
+    field, drawn = None, len(cells[0]) if cells and cells[0] else 0
+    if aa and drawn:
+        field = _aa_field(
+            [[0.0 if value <= 0
+              else min(max((math.log10(value) - lo_log) / width_log, 0.0), 1.0)
+              for value in row] for row in cells], drawn, height)
+    # Resolved once the ramp underneath is known, because which ramp is on the
+    # screen decides which characters are still free to draw on top of it.
+    mark, liq_small, liq_large, liq_late = overlay_glyphs(ascii_only, field is not None)
 
     # Realized events, placed by event time and price on the same axes.
     marks: dict[tuple[int, int], str] = {}
@@ -381,8 +580,8 @@ def render(rows: list[dict], view: str, span: float, height: int, width: int,
                 y = math.floor(((event["px"] - centre) / centre - lo) / step)
             if not (0 <= y < height):
                 continue
-            glyph = LIQ_LATE if event["late_s"] > window_s else (
-                LIQ_LARGE if event["notional"] >= big else LIQ_SMALL)
+            glyph = liq_late if event["late_s"] > window_s else (
+                liq_large if event["notional"] >= big else liq_small)
             marks[(y, x)] = glyph
 
     out = []
@@ -390,7 +589,9 @@ def render(rows: list[dict], view: str, span: float, height: int, width: int,
         line = []
         for x, value in enumerate(cells[y]):
             glyph = " "
-            if value > 0:
+            if field is not None:
+                glyph = field[height - 1 - y][x]
+            elif value > 0:
                 level = (math.log10(value) - lo_log) / width_log
                 glyph = ramp[min(max(int(level * (len(ramp) - 1)), 0), len(ramp) - 1)]
             if (y, x) in marks:
@@ -401,7 +602,7 @@ def render(rows: list[dict], view: str, span: float, height: int, width: int,
         label = (hi - (hi - lo) * (height - 1 - y) / max(height - 1, 1))
         axis = f"{label:>10,.0f}" if view == "absolute" else f"{label * 100:>+9.1f}%"
         out.append(f"{axis} |{''.join(line)}")
-    return "\n".join(out)
+    return "\n".join(out), field is not None
 
 
 def imb_strip(rows: list[dict], bands: list[str], width: int,
@@ -431,6 +632,41 @@ def imb_strip(rows: list[dict], bands: list[str], width: int,
                 line.append(IMB_RAMP[4] if value > 0 else IMB_RAMP[0])
         out.append((band, "".join(line)))
     return out
+
+
+def liq_strip(events: list[dict] | None, window: tuple[int, int],
+              width: int) -> tuple[str, float, float] | None:
+    """`(line, floor, peak)` -- realized notional per column -- or None.
+
+    The map cannot carry this and the overlay glyphs only look as though it can.
+    A liquidation prints AT the mark, so every `x` lands on the price path: a
+    cascade draws as one unreadable column welded to the line, and a print
+    outside the price span does not draw at all. Read up, that says "these
+    minutes were liquidating" and nothing about how much. The strip is where the
+    size lives, on the same time bins as the frame above it.
+    """
+    if not events:
+        return None
+    since, until = window
+    span = (until - since) or 1
+    # Binned exactly as `columns` bins snapshots. The strip is only worth
+    # anything read against the frame, and two binnings that disagree by one
+    # column put a cascade next to the move that caused it.
+    per = [0.0] * width
+    for event in events:
+        x = min(max((event["t"] - since) * width // span, 0), width - 1)
+        per[x] += event["notional"]
+    seen = [v for v in per if v > 0]
+    if not seen:
+        return None
+    floor, peak = min(seen), max(seen)
+    lo_log = math.log10(floor)
+    width_log = (math.log10(peak) - lo_log) or 1.0
+    top = len(LIQ_RAMP) - 1
+    line = "".join(
+        " " if v <= 0 else LIQ_RAMP[min(int((math.log10(v) - lo_log) / width_log * top), top)]
+        for v in per)
+    return line, floor, peak
 
 
 def liquidations(coin: str, since_ns: int, until_ns: int,
@@ -496,7 +732,7 @@ def human_s(seconds: float) -> str:
 def frame(rows: list[dict], coin: str, view: str, span: float, height: int,
           width: int, colour: bool, bands: list[str] | None = None,
           events: list[dict] | None = None, ascii_only: bool = False,
-          window: tuple[int, int] | None = None) -> str:
+          window: tuple[int, int] | None = None, aa: bool = False) -> str:
     first, last = rows[0], rows[-1]
     window = window or (first["t"], last["t"])
     cells, _, _, _ = grid(rows, view, span, height, width, window)
@@ -514,16 +750,34 @@ def frame(rows: list[dict], coin: str, view: str, span: float, height: int,
                 if filled < width else ""))
     qual = (f"coverage {last['coverage']:.3f}   published {last['published_frac']:.3f}   "
             f"bucket {last['bucket_pct'] * 100:.2f}%   mark {last['mark']:,.0f}")
-    body = render(rows, view, span, height, width, colour, events, ascii_only, window)
+    body, used_aa = _render(rows, view, span, height, width, colour, events,
+                            ascii_only, window, aa)
+    realized = liq_strip(events, window, width)
+    if realized:
+        body += f"\n{'liq $':>10} |{realized[0]}"
     if bands:
         strip = imb_strip(rows, bands, width, window)
         body += "\n" + "\n".join(f"{'imb ' + b:>10} |{line}" for b, line in strip)
     ramp = RAMP_ASCII if ascii_only else RAMP
-    mark = MARK_ASCII if ascii_only else MARK_GLYPH
+    if used_aa:
+        ramp = aa_ramp() or ramp
+    mark, liq_small, liq_large, liq_late = overlay_glyphs(ascii_only, used_aa)
     legend = (f"  '{ramp.strip()}' sparse..dense, log scale: "
               f"${floor:,.0f} .. ${ceiling:,.0f} per cell (peak ${peak:,.0f})   "
               f"'{mark}' = price")
     lines = [head, scale, qual, "", body, "", legend]
+    if used_aa:
+        lines.append(f"  aalib tone: {len(ramp.strip())} levels where the block ramp has "
+                     f"{len(RAMP.strip())}, one flat cell per glyph and no dithering, so a "
+                     "glyph reports its own cell and no other")
+    elif aa:
+        # Two different failures, and the note has to say which. Falling back is
+        # fine; blaming a missing library for a library that is sitting right
+        # there sends whoever reads it to install something they already have.
+        lines.append("  (--aa asked for aalib tone; "
+                     + ("libaa is not installed here" if _load_aa() is None
+                        else "libaa would not render at this size")
+                     + ", so this frame is the block ramp)")
     if bands:
         lines.append(f"  imb '{IMB_RAMP[0]}{IMB_RAMP[1]}{IMB_RAMP[2]}{IMB_RAMP[3]}{IMB_RAMP[4]}'"
                      f" = down .. balanced .. up (|imb| < {IMB_MILD} / < {IMB_STRONG};"
@@ -532,8 +786,12 @@ def frame(rows: list[dict], coin: str, view: str, span: float, height: int,
         window_s = ((rows[-1]["t"] - rows[0]["t"]) / NS) or 1.0
         beyond = sum(1 for e in events if e["late_s"] > window_s)
         median_late = _percentile(sorted(e["late_s"] for e in events), 0.50)
-        lines.append(f"  '{LIQ_SMALL}/{LIQ_LARGE}' = realized liquidation (small/large), "
-                     f"'{LIQ_LATE}' arrived after this window closed")
+        lines.append(f"  '{liq_small}/{liq_large}' = realized liquidation (small/large), "
+                     f"'{liq_late}' arrived after this window closed")
+        if realized:
+            lines.append(f"  liq $ '{LIQ_RAMP}' = realized notional per column, log scale "
+                         f"${realized[1]:,.0f} .. ${realized[2]:,.0f}; a liquidation prints at "
+                         "the mark, so the map shows when and this shows how much")
         lines.append(f"  {len(events)} observed, median arrival {median_late / 60:.0f} min "
                      f"after the event, {beyond} later than the window itself")
         lines.append("  observed liquidations, not all liquidations: liqscan reads userFills, "
@@ -556,6 +814,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--width", type=int, default=0, help="0 = fit the terminal")
     parser.add_argument("--ascii", action="store_true",
                         help="digits instead of blocks, and no colour; for pipes and notes")
+    parser.add_argument("--aa", action="store_true",
+                        help="shade through aalib: 23 ASCII tone levels instead of 5. Needs "
+                             "libaa (Debian libaa1, Arch aalib); without it the frame draws "
+                             "the block ramp and says so")
     parser.add_argument("--bands", default="",
                         help="comma-separated imb bands to strip, e.g. 0.01,0.02,0.05")
     parser.add_argument("--liquidations", action="store_true",
@@ -596,12 +858,13 @@ def main(argv: list[str] | None = None) -> int:
 
     term = shutil.get_terminal_size((100, 40))
     width = args.width or max(40, min(term.columns - 13, 220))
-    # Fill the display: the axis, the two header lines, the blanks, the legend
-    # and the notes are the fixed cost; everything else is price rows.
-    height = args.rows or max(8, term.lines - (12 + len(
-        [b for b in args.bands.split(",") if b.strip()])))
     colour = not args.ascii and sys.stdout.isatty()
     bands = [b.strip() for b in args.bands.split(",") if b.strip()]
+    # Fill the display: the axis, the two header lines, the blanks, the legend
+    # and the notes are the fixed cost; everything else is price rows. The strip
+    # and the line explaining it are two more rows the map does not get.
+    height = args.rows or max(8, term.lines - (
+        12 + len(bands) + (2 if args.liquidations else 0) + (1 if args.aa else 0)))
     events = liquidations(args.coin, since, until) if args.liquidations else None
     if clamped:
         print(f"  (asked for more history than exists; clamped to {iso(asked_since)})")
@@ -611,7 +874,7 @@ def main(argv: list[str] | None = None) -> int:
               f"{(until - since) / NS / 3600:.1f} h at ~{kept_cost:.0f} s. "
               f"--budget 0 renders all of it)")
     print(frame(rows, args.coin, args.view, args.span, height, width, colour, bands,
-                events, ascii_only=args.ascii, window=(since, until)))
+                events, ascii_only=args.ascii, window=(since, until), aa=args.aa))
     return 0
 
 

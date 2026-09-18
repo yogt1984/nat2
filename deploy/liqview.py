@@ -232,13 +232,31 @@ def columns(rows: list[dict], width: int,
         for i, row in enumerate(rows):
             out[min(int(i / per), width - 1)].append(row)
         return [c for c in out if c]
-    since, until = window
-    span = (until - since) or 1
     out = [[] for _ in range(width)]
     for row in rows:
-        x = min(max((row["t"] - since) * width // span, 0), width - 1)
-        out[x].append(row)
+        out[time_column(row["t"], window, width)].append(row)
     return out
+
+
+def time_column(t: int, window: tuple[int, int], width: int) -> int:
+    """Which character column a timestamp falls in.
+
+    The one place this is computed, because it used to be computed in three and
+    one of them was wrong. Snapshots were binned here, realized liquidations
+    were placed by walking a list of the first timestamp of each NON-EMPTY
+    column -- which is an index into the non-empty columns, not into the frame.
+    Since time binning started keeping empty bins, every blank column to the
+    left of an event shifted its glyph one column left: on the repo's own gapped
+    fixture a liquidation at the end of the window drew at column 1 of 40, four
+    hours early, in the middle of a hole where there is no price line to sit on.
+
+    That is the same inversion `liquidations` refuses to make when it selects by
+    event time rather than arrival, one step further down the pipe -- a cascade
+    drawn before the move that caused it, on the one picture whose subject is
+    whether the lopsidedness came first.
+    """
+    since, until = window
+    return min(max((t - since) * width // ((until - since) or 1), 0), width - 1)
 
 
 # Measured on su-35: 13.6 MB of hl.liqmap2 parts decompress and parse in 5.6 s.
@@ -416,6 +434,14 @@ def _load_aa():
         lib.aa_image.argtypes = lib.aa_text.argtypes = [ctypes.c_void_p]
         lib.aa_render.argtypes = [ctypes.c_void_p, ctypes.c_void_p] + [ctypes.c_int] * 4
         lib.aa_close.argtypes = [ctypes.c_void_p]
+        # Touched HERE, where the handler is, and not where they are used.
+        # Probing the five FUNCTIONS is not enough: `_aa_field` also
+        # dereferences two DATA symbols, and `in_dll` raises ValueError from
+        # inside the render, outside any try -- so a stripped or stub libaa
+        # tracebacked out of the frame instead of falling back to blocks, which
+        # is the one thing this tool promised not to do.
+        ctypes.c_char.in_dll(lib, AA_DRIVER)
+        Hardware.in_dll(lib, "aa_defparams")
         # Spelled out rather than taken from aa_getrenderparams(), which returns
         # dither=2 (Floyd-Steinberg) and would make the frame depend on the
         # library's defaults -- and on a future libaa changing them.
@@ -560,7 +586,11 @@ def _render(rows: list[dict], view: str, span: float, height: int, width: int,
     marks: dict[tuple[int, int], str] = {}
     if events:
         binned = columns(rows, width, window)
-        edges = [b[0]["t"] for b in binned if b]
+        # Only the legacy path needs these. Index bins have no shared time axis
+        # to measure against -- their columns do not have equal duration -- so
+        # there the compacted walk is all there is, and it is right there
+        # because `columns` drops its empty bins on that path too.
+        edges = [b[0]["t"] for b in binned if b] if window is None else []
         big = _percentile(sorted(e["notional"] for e in events), 0.75)
         # Against the WINDOW, not the column. Nearly every event is late by
         # more than one column -- BTC averages 1,114 s and a column here is
@@ -570,7 +600,9 @@ def _render(rows: list[dict], view: str, span: float, height: int, width: int,
         # watching live, and is the reason a frame redrawn tomorrow differs.
         window_s = ((rows[-1]["t"] - rows[0]["t"]) / NS) or 1.0
         for event in events:
-            x = max(0, min(len([e for e in edges if e <= event["t"]]) - 1, len(binned) - 1))
+            x = (time_column(event["t"], window, len(binned)) if window is not None
+                 else max(0, min(len([e for e in edges if e <= event["t"]]) - 1,
+                                 len(binned) - 1)))
             y = math.floor((event["px"] - lo) / step) if view == "absolute" else None
             if y is None:
                 near = [b for b in binned[x:] + binned[:x] if b]
@@ -647,15 +679,12 @@ def liq_strip(events: list[dict] | None, window: tuple[int, int],
     """
     if not events:
         return None
-    since, until = window
-    span = (until - since) or 1
-    # Binned exactly as `columns` bins snapshots. The strip is only worth
-    # anything read against the frame, and two binnings that disagree by one
-    # column put a cascade next to the move that caused it.
+    # Through `time_column`, the same call the map's own overlay makes. The
+    # strip is only worth anything read against the frame, and two binnings that
+    # disagree put a cascade next to a move that did not cause it.
     per = [0.0] * width
     for event in events:
-        x = min(max((event["t"] - since) * width // span, 0), width - 1)
-        per[x] += event["notional"]
+        per[time_column(event["t"], window, width)] += event["notional"]
     seen = [v for v in per if v > 0]
     if not seen:
         return None
@@ -860,12 +889,14 @@ def main(argv: list[str] | None = None) -> int:
     width = args.width or max(40, min(term.columns - 13, 220))
     colour = not args.ascii and sys.stdout.isatty()
     bands = [b.strip() for b in args.bands.split(",") if b.strip()]
+    events = liquidations(args.coin, since, until) if args.liquidations else None
     # Fill the display: the axis, the two header lines, the blanks, the legend
     # and the notes are the fixed cost; everything else is price rows. The strip
-    # and the line explaining it are two more rows the map does not get.
+    # and the line explaining it are two more rows the map does not get -- but
+    # only when there is a strip. `--liquidations` over a quiet window draws
+    # none, and reserving for it there spends two price rows on nothing.
     height = args.rows or max(8, term.lines - (
-        12 + len(bands) + (2 if args.liquidations else 0) + (1 if args.aa else 0)))
-    events = liquidations(args.coin, since, until) if args.liquidations else None
+        12 + len(bands) + (2 if events else 0) + (1 if args.aa else 0)))
     if clamped:
         print(f"  (asked for more history than exists; clamped to {iso(asked_since)})")
     if trimmed:

@@ -518,14 +518,30 @@ def test_a_glyph_reports_its_own_cell_and_no_other(tmp_path):
     is the phantom-cluster bug again: mass that is not there, invented by the
     renderer. Equal cells must draw equal, whatever surrounds them.
     """
-    # A checkerboard: every cell's neighbourhood is the opposite of its value,
-    # so any bleed between cells shows up immediately.
-    buckets = [[(i - 12) * 0.002, 1_000_000.0 * (10 ** (i % 2)), 0.0, 2] for i in range(24)]
-    _store(tmp_path, [(100.0, buckets) for _ in range(12)])
+    # The fixture is the test, again, and it took three tries.
+    #
+    # It has to defeat BOTH features at once and they need opposite things. A
+    # checkerboard down the price axis alone leaves every column identical, so
+    # horizontal bleed is invisible -- the first cut passed against a renderer
+    # deliberately smeared into its right-hand neighbour. Making it alternate in
+    # both axes fixes that and still misses dithering, because two levels at the
+    # extremes of the scale quantise exactly and leave Floyd-Steinberg no error
+    # to spread. Dithering needs many cells sharing a tone that falls BETWEEN
+    # two glyphs, so the error accumulates along the row and splits them.
+    #
+    # Eleven levels woven across both axes gives both: adjacent cells always
+    # differ, and each tone recurs ~26 times at a value the ramp cannot land on.
+    # Measured against both mutations: clean smears 0 cells, bleeding smears 8,
+    # dithering splits 6.
+    frames = [(100.0, [[(j - 12) * 0.002, 1_000_000.0 * (10 ** (((i * 7 + j * 3) % 11) / 5)),
+                        0.0, 2] for j in range(24)]) for i in range(12)]
+    _store(tmp_path, frames)
     rows = liqview.snapshots("BTC", T0, T0 + 12 * 60 * NS, root=tmp_path)
+    window = _window(rows)
 
-    cells, _, _, _ = liqview.grid(rows, "absolute", 0.05, 20, 12)
-    art = liqview.render(rows, "absolute", 0.05, 20, 12, colour=False, aa=True)
+    cells, _, _, _ = liqview.grid(rows, "absolute", 0.05, 20, 12, window)
+    assert len({tuple(line) for line in zip(*cells)}) > 1, "the fixture must vary across columns"
+    art = liqview.render(rows, "absolute", 0.05, 20, 12, colour=False, window=window, aa=True)
     body = [line.split("|", 1)[1] for line in art.splitlines()]
 
     glyphs = {}
@@ -550,11 +566,19 @@ def test_aa_tone_carries_more_levels_than_the_block_ramp(tmp_path):
     _store(tmp_path, [(100.0, bulk + tail) for _ in range(10)])
     rows = liqview.snapshots("BTC", T0, T0 + 10 * 60 * NS, root=tmp_path)
 
+    def levels(art: str, ramp: str) -> int:
+        # The BODY only. The aa ramp contains '.', '-', '+', '2' and '|', which
+        # the relative view's own axis labels ('+8.0%', '-2.7%') and the column
+        # separator also contain, while `RAMP` cannot appear outside the body at
+        # all -- so counting whole lines inflated exactly one side of this
+        # comparison. Quantising the aa path back to five levels, which undoes
+        # the entire flag, still passed: 9 > 5, all of it axis.
+        drawn = "".join(line.split("|", 1)[1] for line in art.splitlines())
+        return len({c for c in drawn if c in ramp.strip()})
+
     blocks = liqview.render(rows, "relative", 0.08, 24, 30, colour=False)
     tone = liqview.render(rows, "relative", 0.08, 24, 30, colour=False, aa=True)
-    ramp = liqview.aa_ramp()
-    assert len(set(c for c in tone if c in ramp.strip())) > \
-        len(set(c for c in blocks if c in liqview.RAMP.strip()))
+    assert levels(tone, liqview.aa_ramp()) > levels(blocks, liqview.RAMP)
 
 
 @needs_aa
@@ -617,6 +641,36 @@ def test_without_libaa_the_frame_draws_blocks_and_says_so(tmp_path, monkeypatch)
     assert liqview.RAMP.strip() in text
 
 
+def test_a_libaa_missing_the_symbols_we_use_is_a_fallback_not_a_traceback(monkeypatch):
+    """Probing the five FUNCTIONS was not enough.
+
+    `_aa_field` also dereferences two DATA symbols, `mem_d` and `aa_defparams`,
+    and `in_dll` raises ValueError from inside the render where no handler is --
+    so a stripped or partial libaa loaded, reported itself healthy, and then
+    tracebacked out of the frame. Which is the one thing an ops tool you reach
+    for when the box is already unhappy must not do.
+    """
+    import ctypes
+
+    real = ctypes.CDLL
+
+    class Stub:
+        """Loads, has the functions, has neither data symbol."""
+
+        def __getattr__(self, name):
+            if name.startswith("aa_"):
+                return type("F", (), {"restype": None, "argtypes": None})()
+            raise AttributeError(name)
+
+    monkeypatch.setattr(liqview, "_AA_LIB", [])
+    monkeypatch.setattr(liqview, "_AA_RAMP", [])
+    monkeypatch.setattr(ctypes, "CDLL", lambda *a, **k: Stub())
+    assert liqview._load_aa() is None, "a library we cannot actually use is no library"
+    assert liqview._aa_field([[0.5] * 4], 4, 1) is None
+    assert liqview.aa_ramp() is None
+    monkeypatch.setattr(ctypes, "CDLL", real)
+
+
 @needs_aa
 def test_a_library_that_will_not_render_is_not_reported_as_a_missing_one(tmp_path,
                                                                         monkeypatch):
@@ -668,6 +722,61 @@ def test_the_liq_strip_bins_on_the_same_columns_as_the_map(tmp_path):
     assert [x for x, c in enumerate(line) if c != " "] == [0, 7, 19]
     body = liqview.render(rows, "absolute", 0.05, 8, 20, colour=False, window=window)
     assert len(body.splitlines()[0].split("|", 1)[1]) == len(line)
+
+
+def test_the_map_and_the_strip_place_the_same_event_in_the_same_column(tmp_path):
+    """The bug the strip exposed, on the tape shape that exposed it.
+
+    The overlay used to place an event by walking the first timestamp of each
+    NON-EMPTY column -- an index into the non-empty columns, not into the frame.
+    Since time binning started keeping empty bins, every blank column left of an
+    event shifted its glyph one to the left. On this fixture a liquidation at the
+    end of the window drew at column 1 of 40, four hours early, in the middle of
+    a hole with no price line under it. Both rows go through `time_column` now.
+
+    Pinned on a GAPPED tape on purpose: the first version of this test used a
+    dense one, where the two binnings cannot disagree, and passed against the
+    bug.
+    """
+    root, first, last = _gapped(tmp_path)
+    rows = liqview.snapshots("BTC", first, last, root=root)
+    window = (first, last)
+    events = [{"t": last, "px": 100.0, "notional": 9_000_000.0, "method": "m",
+               "late_s": 1.0}]
+
+    line, _, _ = liqview.liq_strip(events, window, 40)
+    body = liqview.render(rows, "absolute", 0.05, 8, 40, colour=False,
+                          events=events, window=window).splitlines()
+    drawn = [l.split("|", 1)[1] for l in body]
+    overlay = {x for row in drawn for x, c in enumerate(row)
+               if c in (liqview.LIQ_SMALL, liqview.LIQ_LARGE, liqview.LIQ_LATE)}
+    digits = {x for x, c in enumerate(line) if c != " "}
+    assert overlay == digits, f"map drew at {sorted(overlay)}, strip at {sorted(digits)}"
+    assert digits == {39}, "an event at the end of the window belongs at the end"
+
+
+@pytest.mark.parametrize("hole", [0, 240])
+def test_every_event_time_lands_where_the_strip_puts_it(tmp_path, hole):
+    """Swept, not spot-checked. The off-by-one only showed for events that fell
+    before the first snapshot inside their own column, so a fixture built from
+    snapshot timestamps -- which are exactly the bin edges -- hid it."""
+    root, first, last = _gapped(tmp_path, before=8, gap_min=hole, after=8)
+    rows = liqview.snapshots("BTC", first, last, root=root)
+    window, width = (first, last), 30
+    disagree = []
+    for k in range(0, 101):
+        t = first + (last - first) * k // 100
+        event = [{"t": t, "px": 100.0, "notional": 1_000.0, "method": "m", "late_s": 1.0}]
+        line, _, _ = liqview.liq_strip(event, window, width)
+        body = liqview.render(rows, "absolute", 0.05, 6, width, colour=False,
+                              events=event, window=window).splitlines()
+        drawn = [l.split("|", 1)[1] for l in body]
+        overlay = {x for row in drawn for x, c in enumerate(row)
+                   if c in (liqview.LIQ_SMALL, liqview.LIQ_LARGE, liqview.LIQ_LATE)}
+        digits = {x for x, c in enumerate(line) if c != " "}
+        if overlay != digits:
+            disagree.append((k, sorted(overlay), sorted(digits)))
+    assert not disagree, f"{len(disagree)} of 101 event times disagree: {disagree[:4]}"
 
 
 def test_the_strip_ranks_notional_not_count(tmp_path):

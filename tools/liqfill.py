@@ -2,26 +2,33 @@
 """nat2 liqfill -- the liqmap2 tape on a regular minute grid, holes carried forward and marked.
 
 `deploy/liqview.py` draws a hole in the tape as a blank column, which is the honest
-picture: no snapshot, nothing known. This writes the *other* file -- the one where every
+picture: no snapshot, nothing known. This keeps the *other* file -- the one where every
 minute has a map -- for work that needs a dense grid (as-of joins, feature rows, a frame
-without gaps). A filled minute carries the newest real snapshot before it, unchanged, and
-is stamped `extrapolated=True` with its `age_s` and the `src_t` it came from. Nothing is
-interpolated: a hole is the last position held still, which is what "we do not know what
-changed" looks like as data.
+of the whole tape without gaps). A filled minute carries the newest real snapshot before
+it, unchanged, and is stamped `extrapolated=True` with its `age_s` and the `src_t` it came
+from. Nothing is interpolated: a hole is the last position held still, which is what "we
+do not know what changed" looks like as data.
 
-The raw store is never touched. Output is one parquet per coin, bucket-exploded like
-`tools/liqcache.py` (same columns plus the three stamps), under `data/cache/`.
+The raw store is never touched. The cache is two parquet files per coin under `data/cache/`:
 
-    /usr/bin/python3 tools/liqfill.py --coin BTC --out data/cache/BTC_filled.parquet
-    /usr/bin/python3 tools/liqfill.py --coin BTC --render --from data/cache/BTC_filled.parquet
+    <COIN>_filled.parquet   one row per (real snapshot, bucket), liqcache's columns + imb_json
+    <COIN>_grid.parquet     one row per minute: t, src_t, extrapolated, age_s
 
-`--render` draws the liqview frame from the filled rows; a column made only of carried
-minutes shows `E` in its top row, so the eye can tell a held position from a seen one.
+and it is incremental: a run scans only the snapshots newer than the cache and appends.
+The first run over the whole tape costs ~5 min per coin; every run after it costs seconds.
+
+    /usr/bin/python3 tools/liqfill.py --coin ETH --render            # update cache, draw all of it
+    /usr/bin/python3 tools/liqfill.py --coin ETH --render --since 48h
+    /usr/bin/python3 tools/liqfill.py --coin ETH --rebuild           # throw the cache away first
+
+`--render` draws the liqview frame from the filled minutes. The first two lines are the
+interval and the step. A column made only of carried minutes shows `E` in its top row.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import time
 from pathlib import Path
@@ -32,73 +39,122 @@ sys.path.insert(0, str(ROOT / "tools"))
 
 import liqview  # noqa: E402
 import liqcache  # noqa: E402
+import numpy as np  # noqa: E402
 import pyarrow as pa  # noqa: E402
-import pyarrow.compute as pc  # noqa: E402
 import pyarrow.parquet as pq  # noqa: E402
 
 NS = liqview.NS
 STEP_NS = 60 * NS
+CACHE = ROOT / "data" / "cache"
 PREFIX = 12          # "    89,724 |" -- the price gutter liqview prints before each grid row
 MARK = "E"
+SNAP_KEYS = ("t", "mark", "coverage", "published_frac", "positions", "outside_span",
+             "span", "bucket_pct")
 
 
-def fill(rows: list[dict], step_ns: int = STEP_NS) -> list[dict]:
-    """One row per grid minute from the first to the last snapshot, oldest first.
+# --- the grid ---------------------------------------------------------------
 
-    A minute with a real snapshot keeps the newest one inside it (`extrapolated=False`,
-    `age_s=0`). A minute without one carries the previous row's map forward.
-    """
-    if not rows:
+def grid_minutes(real_ts: list[int], step_ns: int = STEP_NS) -> list[tuple[int, int, bool, float]]:
+    """`(t, src_t, extrapolated, age_s)` per minute from the first to the last real snapshot."""
+    if not real_ts:
         return []
-    rows = sorted(rows, key=lambda r: r["t"])
-    out: list[dict] = []
-    i, last = 0, None
-    t = rows[0]["t"] - rows[0]["t"] % step_ns
-    end = rows[-1]["t"]
+    out, i, last = [], 0, None
+    t = real_ts[0] - real_ts[0] % step_ns
+    end = real_ts[-1]
     while t <= end:
         newest = None
-        while i < len(rows) and rows[i]["t"] < t + step_ns:
-            newest = rows[i]
+        while i < len(real_ts) and real_ts[i] < t + step_ns:
+            newest = real_ts[i]
             i += 1
         if newest is not None:
             last = newest
-            out.append({**newest, "t": t, "src_t": newest["t"], "extrapolated": False, "age_s": 0.0})
+            out.append((t, newest, False, 0.0))
         elif last is not None:
-            out.append({**last, "t": t, "src_t": last["t"], "extrapolated": True,
-                        "age_s": (t - last["t"]) / NS})
+            out.append((t, last, True, (t - last) / NS))
         t += step_ns
     return out
 
 
+def fill(rows: list[dict], step_ns: int = STEP_NS) -> list[dict]:
+    """liqview rows on the minute grid, holes carried forward. `rows` oldest first."""
+    by_t = {r["t"]: r for r in rows}
+    return [{**by_t[src], "t": t, "src_t": src, "extrapolated": e, "age_s": age}
+            for t, src, e, age in grid_minutes(sorted(by_t))]
+
+
+# --- the cache ---------------------------------------------------------------
+
 def explode(rows: list[dict], coin: str) -> pa.Table:
     table = liqcache.explode(rows, coin)
-    per_row = {r["t"]: r for r in rows}
-    ts = table.column("t").to_pylist()
-    return (table
-            .append_column("src_t", pa.array([per_row[t]["src_t"] for t in ts], pa.int64()))
-            .append_column("extrapolated", pa.array([per_row[t]["extrapolated"] for t in ts]))
-            .append_column("age_s", pa.array([per_row[t]["age_s"] for t in ts], pa.float64())))
+    imb = {r["t"]: json.dumps(r.get("imb") or {}) for r in rows}
+    return table.append_column("imb_json", pa.array([imb[t] for t in table.column("t").to_pylist()]))
 
 
 def implode(table: pa.Table) -> list[dict]:
-    """Bucket rows back into liqview's snapshot rows, for `--render`."""
-    cols = table.to_pydict()
-    rows: dict[int, dict] = {}
-    for k in range(table.num_rows):
-        t = cols["t"][k]
-        r = rows.get(t)
-        if r is None:
-            r = rows[t] = {key: cols[key][k] for key in (
-                "t", "mark", "coverage", "published_frac", "positions", "outside_span",
-                "span", "bucket_pct", "src_t", "extrapolated", "age_s")}
-            r["buckets"], r["imb"] = [], {}
-        r["buckets"].append([cols["lo_pct"][k], cols["notional"][k],
-                             cols["cross_notional"][k], cols["n_positions"][k]])
-    return [rows[t] for t in sorted(rows)]
+    """Bucket rows back into liqview snapshot rows, oldest first. numpy slicing, not a dict loop."""
+    if table.num_rows == 0:
+        return []
+    table = table.sort_by("t")
+    t = table.column("t").to_numpy()
+    cuts = np.flatnonzero(np.diff(t)) + 1
+    starts = np.concatenate(([0], cuts))
+    cols = {k: table.column(k).to_numpy(zero_copy_only=False) for k in
+            ("lo_pct", "notional", "cross_notional", "n_positions")}
+    snap = {k: table.column(k).to_pylist() for k in SNAP_KEYS}
+    imb = table.column("imb_json").to_pylist()
+    rows = []
+    for a, b in zip(starts, np.concatenate((cuts, [len(t)]))):
+        r = {k: snap[k][a] for k in SNAP_KEYS}
+        r["imb"] = json.loads(imb[a])
+        r["buckets"] = [list(x) for x in zip(cols["lo_pct"][a:b].tolist(), cols["notional"][a:b].tolist(),
+                                              cols["cross_notional"][a:b].tolist(),
+                                              cols["n_positions"][a:b].tolist())]
+        rows.append(r)
+    return rows
 
+
+def paths(coin: str) -> tuple[Path, Path]:
+    return CACHE / f"{coin}_filled.parquet", CACHE / f"{coin}_grid.parquet"
+
+
+def update(coin: str, rebuild: bool = False, log=print) -> list[dict]:
+    """Bring the coin's cache up to the tape and return its real snapshot rows."""
+    buckets_path, grid_path = paths(coin)
+    CACHE.mkdir(parents=True, exist_ok=True)
+    have: pa.Table | None = None
+    since = liqview.earliest_ns()
+    if buckets_path.exists() and not rebuild:
+        have = pq.read_table(buckets_path)
+        if have.num_rows:
+            since = int(pa.compute.max(have.column("t")).as_py()) + 1
+    t0 = time.monotonic()
+    new = liqview.snapshots(coin, since, time.time_ns())
+    if new:
+        table = explode(new, coin)
+        table = pa.concat_tables([have, table]) if have is not None and have.num_rows else table
+        pq.write_table(table, buckets_path, compression="zstd")
+    else:
+        table = have
+    if table is None or table.num_rows == 0:
+        return []
+    rows = implode(table)
+    g = grid_minutes([r["t"] for r in rows])
+    pq.write_table(pa.table({
+        "t": pa.array([x[0] for x in g], pa.int64()), "src_t": pa.array([x[1] for x in g], pa.int64()),
+        "extrapolated": pa.array([x[2] for x in g]), "age_s": pa.array([x[3] for x in g], pa.float64()),
+    }), grid_path, compression="zstd")
+    n_e = sum(1 for x in g if x[2])
+    log(f"cache {coin}: +{len(new):,} new snapshots in {time.monotonic() - t0:.0f}s -> "
+        f"{len(rows):,} real, {len(g):,} minutes, {n_e:,} carried ({n_e / max(len(g), 1):.1%}), "
+        f"longest hole {max((x[3] for x in g), default=0) / 3600:.1f} h   "
+        f"{buckets_path.stat().st_size / 1e6:.0f} MB + {grid_path.stat().st_size / 1e6:.1f} MB")
+    return rows
+
+
+# --- the frame ---------------------------------------------------------------
 
 def mark_frame(text: str, rows: list[dict], width: int, window: tuple[int, int]) -> str:
-    """Put `E` in the top grid row of every column that holds only carried minutes."""
+    """Interval and step first; `E` in the top grid row of every column of carried minutes only."""
     bins = liqview.columns(rows, width, window)
     carried = [bool(b) and all(r["extrapolated"] for r in b) for b in bins]
     lines = text.split("\n")
@@ -109,19 +165,22 @@ def mark_frame(text: str, rows: list[dict], width: int, window: tuple[int, int])
         if c:
             row[PREFIX + x] = MARK
     lines[top] = "".join(row)
-    n = sum(carried)
-    lines.insert(3, f"filled grid: {len(rows)} minutes, {sum(r['extrapolated'] for r in rows)} "
-                    f"carried forward   {n}/{width} columns entirely carried = '{MARK}' on the top row")
-    return "\n".join(lines)
+    n_e = sum(r["extrapolated"] for r in rows)
+    head = [
+        f"interval  {liqview.iso(window[0])} -> {liqview.iso(window[1])}   "
+        f"{liqview.human_s((window[1] - window[0]) / NS)}",
+        f"step      {liqview.human_s(liqview.col_seconds(window, width))} per column   "
+        f"grid 1 min   {len(rows):,} minutes, {n_e:,} carried forward   "
+        f"{sum(carried)}/{width} columns entirely carried = '{MARK}' on the top row",
+    ]
+    return "\n".join(head + lines)
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--coin", required=True)
-    parser.add_argument("--since", default="max")
-    parser.add_argument("--until", default=None)
-    parser.add_argument("--out", type=Path, help="parquet to write (default data/cache/<COIN>_filled.parquet)")
-    parser.add_argument("--from", dest="src", type=Path, help="render from an existing filled parquet")
+    parser.add_argument("--since", default="max", help="window to render; the cache always holds all")
+    parser.add_argument("--rebuild", action="store_true", help="discard the cache and rescan the tape")
     parser.add_argument("--render", action="store_true")
     parser.add_argument("--span", type=float, default=0.03)
     parser.add_argument("--rows", type=int, default=30)
@@ -129,34 +188,20 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--bands", default="0.01,0.05")
     args = parser.parse_args(argv)
 
-    t0 = time.monotonic()
-    if args.src:
-        filled = implode(pq.read_table(args.src))
-    else:
-        now_ns = time.time_ns()
-        until = liqview.parse_when(args.until, now_ns) if args.until else now_ns
-        since = liqview.earliest_ns() if args.since == "max" else liqview.parse_when(args.since, now_ns)
-        rows = liqview.snapshots(args.coin, since, until)
-        if not rows:
-            print(f"no {args.coin} snapshots", file=sys.stderr)
-            return 1
-        filled = fill(rows)
-        out = args.out or ROOT / "data" / "cache" / f"{args.coin}_filled.parquet"
-        out.parent.mkdir(parents=True, exist_ok=True)
-        table = explode(filled, args.coin)
-        pq.write_table(table, out, compression="zstd")
-        n_e = sum(r["extrapolated"] for r in filled)
-        print(f"{args.coin}  {liqview.iso(filled[0]['t'])} -> {liqview.iso(filled[-1]['t'])}  "
-              f"{len(rows):,} real snapshots -> {len(filled):,} minutes, {n_e:,} carried "
-              f"({n_e / len(filled):.1%}), longest hole "
-              f"{max((r['age_s'] for r in filled), default=0) / 3600:.1f} h")
-        print(f"  {table.num_rows:,} bucket rows  {out.stat().st_size / 1e6:.1f} MB  "
-              f"{time.monotonic() - t0:.0f}s  -> {out}")
-    if args.render:
-        window = (filled[0]["t"], filled[-1]["t"])
-        text = liqview.frame(filled, args.coin, "absolute", args.span, args.rows, args.width,
-                             False, bands=[b for b in args.bands.split(",") if b], window=window)
-        print(mark_frame(text, filled, args.width, window))
+    rows = update(args.coin, args.rebuild, log=lambda s: print(s, file=sys.stderr))
+    if not rows:
+        print(f"no {args.coin} snapshots", file=sys.stderr)
+        return 1
+    if not args.render:
+        return 0
+    filled = fill(rows)
+    if args.since != "max":
+        since = liqview.parse_when(args.since, time.time_ns())
+        filled = [r for r in filled if r["t"] >= since]
+    window = (filled[0]["t"], filled[-1]["t"])
+    text = liqview.frame(filled, args.coin, "absolute", args.span, args.rows, args.width,
+                         False, bands=[b for b in args.bands.split(",") if b], window=window)
+    print(mark_frame(text, filled, args.width, window))
     return 0
 
 

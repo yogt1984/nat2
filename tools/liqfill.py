@@ -180,6 +180,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--coin", required=True)
     parser.add_argument("--since", default="max", help="window to render; the cache always holds all")
+    parser.add_argument("--until", default=None, help="close the rendered window early")
     parser.add_argument("--rebuild", action="store_true", help="discard the cache and rescan the tape")
     parser.add_argument("--render", action="store_true")
     parser.add_argument("--span", type=float, default=0.03)
@@ -195,9 +196,13 @@ def main(argv: list[str] | None = None) -> int:
     if not args.render:
         return 0
     filled = fill(rows)
-    if args.since != "max":
-        since = liqview.parse_when(args.since, time.time_ns())
-        filled = [r for r in filled if r["t"] >= since]
+    now = time.time_ns()
+    since = liqview.parse_when(args.since, now) if args.since != "max" else 0
+    until = liqview.parse_when(args.until, now) if args.until else now
+    filled = [r for r in filled if since <= r["t"] <= until]
+    if not filled:
+        print(f"no {args.coin} minutes in the window", file=sys.stderr)
+        return 1
     window = (filled[0]["t"], filled[-1]["t"])
     text = liqview.frame(filled, args.coin, "absolute", args.span, args.rows, args.width,
                          False, bands=[b for b in args.bands.split(",") if b], window=window)
